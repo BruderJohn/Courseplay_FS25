@@ -57,6 +57,7 @@ function AIDriveStrategyRefillAtLoader:init(task, job)
     self.lastSearchedFillType = nil  -- Track what we're searching for
     self.targetRefillPosition = nil
     self.refillAlignCourse = nil
+    self.refillApproachNode = nil
     self.refillApproachRetryCount = 0
     self.foldStartedAt = 0
     self.foldTimeoutMs = 12000
@@ -141,6 +142,10 @@ function AIDriveStrategyRefillAtLoader:areFoldablesReadyForPathfinding()
 end
 
 function AIDriveStrategyRefillAtLoader:delete()
+    if self.refillApproachNode then
+        CpUtil.destroyNode(self.refillApproachNode)
+        self.refillApproachNode = nil
+    end
     AIDriveStrategyCourse.delete(self)
 end
 
@@ -325,8 +330,12 @@ function AIDriveStrategyRefillAtLoader:startPathfindingAfterFold()
     CpUtil.info('REFILL STRATEGY: Vehicle start world: (%.1f, %.1f, %.1f), target local: (%.1f, %.1f)',
         vehicleX, vehicleY, vehicleZ, localTargetX, localTargetZ)
 
-    -- Robust direct approach: drive to discharge node area without additional align-course offsets.
+    -- Build a deterministic final alignment segment parallel to the loader axis.
     self.refillAlignCourse = nil
+    if self.refillApproachNode then
+        CpUtil.destroyNode(self.refillApproachNode)
+        self.refillApproachNode = nil
+    end
     if self.dischargeNode and self.dischargeNode.node then
         local dx, _, dz = getWorldTranslation(self.dischargeNode.node)
         self.targetRefillPosition = { x = dx, z = dz }
@@ -369,22 +378,37 @@ function AIDriveStrategyRefillAtLoader:startPathfindingAfterFold()
     CpUtil.info('REFILL STRATEGY: Using field %d, max fruit 10%%, default off-field penalty', fieldNum or 0)
     CpUtil.info('REFILL STRATEGY: Ignoring off-field penalty in 45m radius around loader')
     
-    self.pathfindingStartedAt = g_currentMission.time
-    if self.dischargeNode and self.dischargeNode.node then
-        local goalX, _, goalZ = getWorldTranslation(self.dischargeNode.node)
-        local _, goalYRot, _ = getWorldRotation(self.dischargeNode.node)
-        local goal = State3D(goalX, -goalZ, CpMathUtil.angleFromGame(goalYRot))
-        CpUtil.info('REFILL STRATEGY: Path request uses discharge world goal -> x %.2f, z %.2f, yRot %.1f',
-            goalX, goalZ, math.deg(goalYRot))
-        self.pathfinder, result = PathfinderUtil.startPathfindingFromVehicleToGoal(goal, context)
-    else
-        local approachOffsetX = 0
-        local approachOffsetZ = -2
-        CpUtil.info('REFILL STRATEGY: Path request fallback uses target node offsets -> offsetX %.2f, approachZ %.2f',
-            approachOffsetX, approachOffsetZ)
-        self.pathfinder, result = PathfinderUtil.startPathfindingFromVehicleToNode(
-            targetNode, approachOffsetX, approachOffsetZ, context)
+    local approachNode = targetNode
+    if self.dischargeNode and self.dischargeNode.node and self.loaderVehicle and self.loaderVehicle.rootNode then
+        local goalX, goalY, goalZ = getWorldTranslation(self.dischargeNode.node)
+        local goalYRot = self:getParallelHeadingForLoader()
+        if not goalYRot then
+            local _, loaderYRot, _ = getWorldRotation(self.loaderVehicle.rootNode)
+            goalYRot = loaderYRot
+        end
+        self.refillApproachNode = createTransformGroup('cpRefillApproachNode')
+        link(getRootNode(), self.refillApproachNode)
+        setTranslation(self.refillApproachNode, goalX, goalY, goalZ)
+        setRotation(self.refillApproachNode, 0, goalYRot, 0)
+        approachNode = self.refillApproachNode
+        CpUtil.info('REFILL STRATEGY: Using virtual approach node at discharge position with loader-parallel heading %.1f°',
+            math.deg(goalYRot))
     end
+
+    -- Same pattern as unload wagon: path to offset start, then append a straight parallel align segment.
+    self.refillAlignCourse = Course.createFromNode(self.vehicle, approachNode,
+        offsetX, -alignLength + 1, 0, 1, false)
+    if self.refillAlignCourse then
+        local lastIx = self.refillAlignCourse:getNumberOfWaypoints()
+        local tx, tz = self.refillAlignCourse:getWaypointPosition(lastIx)
+        self.targetRefillPosition = { x = tx, z = tz }
+        CpUtil.info('REFILL STRATEGY: Target position from refill align course: (%.1f, %.1f)', tx, tz)
+    end
+
+    self.pathfindingStartedAt = g_currentMission.time
+    CpUtil.info('REFILL STRATEGY: Path request (unload-style) -> offsetX %.2f, approachZ %.2f', offsetX, -alignLength)
+    self.pathfinder, result = PathfinderUtil.startPathfindingFromVehicleToNode(
+        approachNode, offsetX, -alignLength, context)
     
     if result.done then
         -- Pathfinding completed immediately
@@ -553,6 +577,9 @@ function AIDriveStrategyRefillAtLoader:onPathfindingDoneToLoader(path)
         end
         CpUtil.info('REFILL STRATEGY: >>> Driving to loader NOW <<<')
         local course = Course(self.vehicle, CpMathUtil.pointsToGameInPlace(path), true)
+        if self.refillAlignCourse then
+            course:append(self.refillAlignCourse)
+        end
         self:startCourse(course, 1)
         self.state = self.states.DRIVING_TO_LOADER
         self.ppc:disableStopWhenOffTrack(15000)
@@ -564,6 +591,25 @@ function AIDriveStrategyRefillAtLoader:onPathfindingDoneToLoader(path)
         self.state = self.states.WAITING_FOR_REFILL
         CpUtil.info('=========================================')
     end
+end
+
+function AIDriveStrategyRefillAtLoader:getParallelHeadingForLoader()
+    if not self.loaderVehicle or not self.loaderVehicle.rootNode then
+        return nil
+    end
+
+    local _, loaderYRot, _ = getWorldRotation(self.loaderVehicle.rootNode)
+    local _, vehicleYRot, _ = getWorldRotation(self.vehicle:getAIDirectionNode())
+    local oppositeLoaderYRot = loaderYRot + math.pi
+
+    local deltaSame = math.abs(CpMathUtil.getDeltaAngle(loaderYRot, vehicleYRot))
+    local deltaOpposite = math.abs(CpMathUtil.getDeltaAngle(oppositeLoaderYRot, vehicleYRot))
+
+    if deltaOpposite < deltaSame then
+        return oppositeLoaderYRot
+    end
+
+    return loaderYRot
 end
 
 function AIDriveStrategyRefillAtLoader:getDistanceToDischargeNode()
