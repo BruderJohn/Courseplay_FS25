@@ -83,7 +83,7 @@
 			<Values>
 				<Value name="REFILL_ON_FIELD_DISABLED">0</Value>
 				<Value name="REFILL_ON_FIELD_WAITING">1</Value>
-				<!-- <Value name="REFILL_ON_FIELD_ACTIVE">2</Value> -->
+				<Value name="REFILL_ON_FIELD_ACTIVE">2</Value>
 			</Values>
 			<Texts>
 				<Text prefix="false">CP_deactivated</Text>

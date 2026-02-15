@@ -5,6 +5,13 @@ CpAITaskFieldWork = CpObject(CpAITask)
 function CpAITaskFieldWork:reset()
 	self.startPosition = nil
 	self.waitingForRefillingActive = false
+	self.drivingToLoaderActive = false
+	self.refillStrategy = nil
+	self.refillFailedTimestamp = nil
+	self.refillCooldownMs = 30000  -- 30 seconds cooldown after refill failure
+	self.savedFieldPolygon = nil  -- Save field polygon for refill strategy
+	self.savedIslandPolygons = nil
+	self.waitingForFieldBoundary = false  -- Waiting for field boundary detection to finish
 	CpAITask.reset(self)
 end
 
@@ -21,7 +28,166 @@ function CpAITaskFieldWork:setWaitingForRefillingActive()
 	end
 end
 
+function CpAITaskFieldWork:setDrivingToLoaderActive()
+	local cpSpec = self.vehicle.spec_cpAIFieldWorker
+	
+	-- Check if we're in cooldown after a previous failure
+	if self.refillFailedTimestamp then
+		local timeSinceFailure = g_currentMission.time - self.refillFailedTimestamp
+		if timeSinceFailure < self.refillCooldownMs then
+			local remainingSeconds = math.ceil((self.refillCooldownMs - timeSinceFailure) / 1000)
+			if g_updateLoopIndex % 100 == 0 then  -- Log every ~3 seconds
+				self:debug('REFILL: In cooldown, waiting %d more seconds before next attempt', remainingSeconds)
+			end
+			return
+		end
+		-- Cooldown expired, clear flag
+		self:debug('REFILL: Cooldown expired, ready for new refill attempt')
+		self.refillFailedTimestamp = nil
+	end
+	
+	if not self.drivingToLoaderActive and not self.waitingForFieldBoundary and cpSpec.driveStrategy then
+		CpUtil.info('=========================================')
+		CpUtil.info('REFILL: Starting automatic drive to loader')
+		CpUtil.info('REFILL: Current waypoint: %d', cpSpec.driveStrategy.ppc:getCurrentWaypointIx())
+		
+		-- WICHTIG: Fahrzeug sofort anhalten während Strategie-Wechsel
+		self.vehicle:cpHold(60000, true)  -- 60 Sekunden maximale Haltezeit
+		CpUtil.info('REFILL: ✓ Vehicle STOPPED during strategy switch')
+		
+		-- Try to get field polygon
+		CpUtil.info('REFILL: Checking for field polygon...')
+		self.savedFieldPolygon = self.vehicle:cpGetFieldPolygon()
+		self.savedIslandPolygons = self.vehicle:cpGetIslandPolygons()
+		
+		if self.savedFieldPolygon then
+			CpUtil.info('REFILL: ✓ Field polygon available with %d vertices', #self.savedFieldPolygon)
+			for i = 1, math.min(3, #self.savedFieldPolygon) do
+				CpUtil.info('REFILL:   Vertex %d: x=%.1f, z=%.1f', i, self.savedFieldPolygon[i].x, self.savedFieldPolygon[i].z)
+			end
+		else
+			-- No polygon available - need to detect field boundary first
+			CpUtil.info('REFILL: !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!')
+			CpUtil.info('REFILL: No field polygon available yet')
+			CpUtil.info('REFILL: Starting field boundary detection NOW...')
+			
+			-- Check if detection is already running
+			if self.vehicle:cpIsFieldBoundaryDetectionRunning() then
+				CpUtil.info('REFILL: Detection already running, waiting for it to finish')
+			else
+				-- Start detection at vehicle's current position
+				local x, _, z = getWorldTranslation(self.vehicle.rootNode)
+				CpUtil.info('REFILL: Starting detection at vehicle position: %.1f, %.1f', x, z)
+				
+				-- Start the detection with a callback
+				self.vehicle:cpDetectFieldBoundary(x, z, self, function(task, vehicle, fieldPolygon, islandPolygons)
+					task.savedFieldPolygon = fieldPolygon
+					task.savedIslandPolygons = islandPolygons
+					task.waitingForFieldBoundary = false
+					
+					if fieldPolygon then
+						CpUtil.info('REFILL: ✓✓✓ Field boundary detected with %d vertices', #fieldPolygon)
+						CpUtil.info('REFILL: Now continuing with refill...')
+					else
+						CpUtil.info('REFILL: ERROR - Field boundary detection failed (no polygon returned)')
+					end
+				end)
+				
+				CpUtil.info('REFILL: Field boundary detection started, waiting for results...')
+			end
+			
+			CpUtil.info('REFILL: !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!')
+			
+			-- Set flag to wait for boundary detection
+			self.waitingForFieldBoundary = true
+			return  -- Don't proceed with refill yet
+		end
+		
+		self.drivingToLoaderActive = true
+		-- Save current course state
+		self.savedCourse = cpSpec.driveStrategy.course
+		self.savedWaypointIx = cpSpec.driveStrategy.ppc:getCurrentWaypointIx()
+		CpUtil.info('REFILL: Saved course state for return (waypoint %d)', self.savedWaypointIx)
+		
+		-- Create and start refill strategy
+		CpUtil.info('REFILL: Creating AIDriveStrategyRefillAtLoader')
+		self.refillStrategy = AIDriveStrategyRefillAtLoader(self, self.job)
+		CpUtil.info('REFILL: Strategy instance created')
+		
+		-- Pass the saved field polygon to the refill strategy BEFORE setAIVehicle
+		-- because setAIVehicle triggers the first update which calls start()
+		CpUtil.info('REFILL: Passing field polygon to strategy...')
+		if self.savedFieldPolygon then
+			CpUtil.info('REFILL: Passing field polygon with %d vertices', #self.savedFieldPolygon)
+			self.refillStrategy:setFieldPolygon(self.savedFieldPolygon, self.savedIslandPolygons)
+			CpUtil.info('REFILL: ✓ Field polygon passed successfully')
+		else
+			CpUtil.info('REFILL: !!!!! WARNING - No field polygon to pass !!!!!')
+		end
+		
+		CpUtil.info('REFILL: Calling setAIVehicle...')
+		self.refillStrategy:setAIVehicle(self.vehicle, self.job:getCpJobParameters())
+		CpUtil.info('REFILL: setAIVehicle done')
+
+		-- IMPORTANT: replace active AIFieldWorker strategy list as well,
+		-- otherwise the old fieldwork strategy may keep running in parallel and trigger off-track stops.
+		local aiSpec = self.vehicle.spec_aiFieldWorker
+		if aiSpec and aiSpec.driveStrategies then
+			for i = #aiSpec.driveStrategies, 1, -1 do
+				aiSpec.driveStrategies[i]:delete()
+				table.remove(aiSpec.driveStrategies, i)
+			end
+		else
+			aiSpec.driveStrategies = {}
+		end
+		table.insert(aiSpec.driveStrategies, self.refillStrategy)
+		cpSpec.driveStrategy = self.refillStrategy
+		
+		CpUtil.info('REFILL: Calling startCpWithStrategy...')
+		self.vehicle:startCpWithStrategy(self.refillStrategy)
+		CpUtil.info('REFILL: ✓ Refill strategy started successfully')
+		CpUtil.info('=========================================')
+	end
+end
+
 function CpAITaskFieldWork:update(dt)
+	-- Safety check: vehicle might be nil after job has been stopped
+	if not self.vehicle then
+		return
+	end
+	
+	-- Check if we're waiting for field boundary detection
+	if self.waitingForFieldBoundary then
+		if not self.vehicle:cpIsFieldBoundaryDetectionRunning() then
+			-- Detection finished! Check if we got a polygon
+			self.savedFieldPolygon = self.vehicle:cpGetFieldPolygon()
+			self.savedIslandPolygons = self.vehicle:cpGetIslandPolygons()
+			
+			if self.savedFieldPolygon then
+				CpUtil.info('REFILL: ✓✓✓ Field boundary detection complete!')
+				CpUtil.info('REFILL: Got polygon with %d vertices', #self.savedFieldPolygon)
+				CpUtil.info('REFILL: Now continuing with refill process...')
+				self.waitingForFieldBoundary = false
+				-- Continue with refill now that we have the polygon
+				self:setDrivingToLoaderActive()
+			else
+				CpUtil.info('REFILL: ERROR - Field boundary detection completed but returned no polygon')
+				CpUtil.info('REFILL: This is very unusual - stopping job')
+				self.waitingForFieldBoundary = false
+				self.refillFailedTimestamp = g_currentMission.time
+				self.vehicle:stopCurrentAIJob(AIMessageErrorOutOfFill.new())
+			end
+		else
+			-- Still waiting - keep vehicle stopped
+			self.vehicle:cpHold(1500, true)
+			self.vehicle:setCpInfoTextActive(InfoTextManager.WAITING)
+			if g_updateLoopIndex % 100 == 0 then  -- Every ~3 seconds
+				CpUtil.info('REFILL: Still waiting for field boundary detection...')
+			end
+		end
+		return  -- Don't do anything else while waiting
+	end
+	
 	-- Hack to reevaluate the refill condition for the new setting state after it changed.
 	local settingWasChanged = false
 	if self.lastSettingValues then 
@@ -52,11 +218,91 @@ function CpAITaskFieldWork:update(dt)
 			self.vehicle:resetCpActiveInfoText(InfoTextManager.NEEDS_FILLING)
 		end
 	end
-	self.lastSettingValues = {
-		optionalFertilizer = self.vehicle:getCpSettings().sowingMachineFertilizerEnabled:getValue(),
-		optionalSowing = self.vehicle:getCpSettings().optionalSowingMachineEnabled:getValue()
-	}
 
+	if self.drivingToLoaderActive then
+		local cpSpec = self.vehicle.spec_cpAIFieldWorker
+		
+		-- Check if we're waiting for a loader to appear
+		if self.refillStrategy and self.refillStrategy.state == self.refillStrategy.states.WAITING_FOR_LOADER then
+			-- Just wait, vehicle is stopped and searching for loader every 5 seconds
+			-- Don't stop the job, let it continue waiting
+			self.vehicle:setCpInfoTextActive(InfoTextManager.NEEDS_FILLING)
+			if g_updateLoopIndex % 200 == 0 then  -- Every ~6 seconds
+				self:debug('REFILL: Waiting for suitable loader to appear at field edge...')
+			end
+			return  -- Continue waiting without stopping job
+		end
+		
+		-- Check if refill strategy has finished
+		if self.refillStrategy and self.refillStrategy.state == self.refillStrategy.states.REFILL_COMPLETE then
+			self:debug('=========================================')
+			
+			-- Check if refill actually succeeded or failed
+			local refillSucceeded = self.refillStrategy.refillSucceeded or false
+			
+			if refillSucceeded then
+				self:debug('REFILL: Refill completed successfully, returning to fieldwork')
+				-- Restart fieldwork strategy with saved course
+				if self.savedCourse then
+					self:debug('REFILL: Restoring fieldwork course at waypoint %d', self.savedWaypointIx)
+					local strategy = AIDriveStrategyFieldWorkCourse(self, self.job)
+					strategy:setAIVehicle(self.vehicle, self.job:getCpJobParameters())
+					strategy:start(self.savedCourse, self.savedWaypointIx, self.job:getCpJobParameters())
+					local aiSpec = self.vehicle.spec_aiFieldWorker
+					local cpSpec = self.vehicle.spec_cpAIFieldWorker
+					if aiSpec and aiSpec.driveStrategies then
+						for i = #aiSpec.driveStrategies, 1, -1 do
+							aiSpec.driveStrategies[i]:delete()
+							table.remove(aiSpec.driveStrategies, i)
+						end
+					else
+						aiSpec.driveStrategies = {}
+					end
+					table.insert(aiSpec.driveStrategies, strategy)
+					cpSpec.driveStrategy = strategy
+					self.vehicle:startCpWithStrategy(strategy)
+					self.savedCourse = nil
+					self.savedWaypointIx = nil
+					self:debug('REFILL: Fieldwork resumed successfully')
+				else
+					self:debug('REFILL: ERROR - No saved course found!')
+				end
+			else
+				self:debug('REFILL: Refill FAILED (no loader found or other error)')
+				self:debug('REFILL: Setting cooldown period of %d seconds', self.refillCooldownMs / 1000)
+				self:debug('REFILL: Vehicle will STOP and wait for manual intervention')
+				self:debug('REFILL: You can:')
+				self:debug('REFILL:   - Manually drive to a tanker to refill')
+				self:debug('REFILL:   - Place a tanker at field edge and restart CP')
+				self:debug('REFILL:   - Wait for automatic retry after cooldown')
+				self.refillFailedTimestamp = g_currentMission.time
+				-- Stop the job completely - do not restart fieldwork
+				-- The user needs to manually refill or place a tanker
+				self:debug('REFILL: Stopping AI job due to failed refill attempt')
+				self.vehicle:stopCurrentAIJob(AIMessageErrorOutOfFill.new())
+				self.savedCourse = nil
+				self.savedWaypointIx = nil
+			end
+			
+			self.drivingToLoaderActive = false
+			self.refillStrategy = nil
+			self:debug('=========================================')
+		elseif self.refillStrategy then
+			-- Log current state
+			local stateName = self.refillStrategy.state and self.refillStrategy.state.name or 'UNKNOWN'
+			if g_updateLoopIndex % 100 == 0 then  -- Every ~3 seconds
+				self:debug('REFILL: Current state: %s', stateName)
+			end
+		end
+	end
+	
+	-- Store settings values for change detection (only if vehicle is still valid)
+	if self.vehicle then
+		self.lastSettingValues = {
+			optionalFertilizer = self.vehicle:getCpSettings().sowingMachineFertilizerEnabled:getValue(),
+			optionalSowing = self.vehicle:getCpSettings().optionalSowingMachineEnabled:getValue()
+		}
+	end
 end
 
 --- This function can be used to trace the triggering of AI events. The timing of these is critical for multiplayer
@@ -92,7 +338,12 @@ end
 
 --- Makes sure the cp fieldworker gets started.
 function CpAITaskFieldWork:start()
-	self:debug("Field work task started.")
+	CpUtil.info("=========================================")
+	CpUtil.info("FIELD WORK: Task START() called")
+	CpUtil.info("FIELD WORK: Field polygon will be captured at refill time")
+	CpUtil.info("FIELD WORK: (Field boundary detection may not be complete yet)")
+	CpUtil.info("=========================================")
+	
 	local spec = self.vehicle.spec_aiFieldWorker
 	spec.isActive = true
 	if self.isServer then

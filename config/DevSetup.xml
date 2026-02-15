@@ -7,7 +7,7 @@
 	name : corresponds to the call name, for example courseplay.DBG_MODE_1.
 -->
 
-<DevSetup isDev = "false">
+<DevSetup isDev = "true">
 	<DebugChannels>
 		<DebugChannel id="1">false</DebugChannel>
 		<DebugChannel name="DBG_MODE_2">false</DebugChannel>

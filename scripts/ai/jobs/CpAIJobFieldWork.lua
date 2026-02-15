@@ -51,20 +51,54 @@ function CpAIJobFieldWork:isFinishingAllowed(message)
     local nextTaskIndex = self:getNextTaskIndex()
 	if message:isa(AIMessageErrorOutOfFill) then
         --- At least one implement type needs to be refilled.
-
+        CpUtil.info('===========================================')
+        CpUtil.info('REFILL JOB: isFinishingAllowed() called - Out of Fill!')
+        
         local vehicle = self:getVehicle()
+        CpUtil.info('REFILL JOB: Vehicle: %s', CpUtil.getName(vehicle))
+        
         local setting = vehicle:getCpSettings().refillOnTheField
+        local settingValue = setting:getValue()
+        CpUtil.info('REFILL JOB: refillOnTheField setting value: %d', settingValue)
+        CpUtil.info('REFILL JOB: DISABLED=%d, WAITING=%d, ACTIVE=%d', 
+            CpVehicleSettings.REFILL_ON_FIELD_DISABLED or 0,
+            CpVehicleSettings.REFILL_ON_FIELD_WAITING or 1,
+            CpVehicleSettings.REFILL_ON_FIELD_ACTIVE or 2)
 
-        if setting:getValue() == CpVehicleSettings.REFILL_ON_FIELD_DISABLED then
+        if settingValue == CpVehicleSettings.REFILL_ON_FIELD_DISABLED or settingValue == 0 then
+            CpUtil.info('REFILL JOB: Mode is DISABLED - stopping job')
             return true
-        elseif setting:getValue() == CpVehicleSettings.REFILL_ON_FIELD_WAITING then
+        elseif settingValue == CpVehicleSettings.REFILL_ON_FIELD_WAITING or settingValue == 1 then
+            CpUtil.info('REFILL JOB: Mode is WAITING - activating waiting state')
             if self.currentTaskIndex == self.fieldWorkTask.taskIndex then
                 self.fieldWorkTask:setWaitingForRefillingActive()
             end
-        elseif setting:getValue() == CpVehicleSettings.REFILL_ON_FIELD_ACTIVE then
-            --- TODO_25 Add driving to trailer for refilling here and so on ..
-            self.fieldWorkTask:skip()
+        elseif settingValue == CpVehicleSettings.REFILL_ON_FIELD_ACTIVE or settingValue == 2 then
+            CpUtil.info('REFILL JOB: Mode is ACTIVE - starting automatic refill')
+            --- Drive to a loader/filler vehicle at the field edge for refilling
+            if self.currentTaskIndex == self.fieldWorkTask.taskIndex then
+                -- Check if we're in cooldown after a previous failed attempt
+                if self.fieldWorkTask.refillFailedTimestamp then
+                    local timeSinceFailure = g_currentMission.time - self.fieldWorkTask.refillFailedTimestamp
+                    if timeSinceFailure < self.fieldWorkTask.refillCooldownMs then
+                        -- In cooldown - stop the job to prevent endless retry loop
+                        CpUtil.info('REFILL JOB: In cooldown after failed refill, stopping job')
+                        return true
+                    end
+                end
+                
+                -- Try to start automatic drive to loader
+                CpUtil.info('REFILL JOB: !!!!! Calling setDrivingToLoaderActive() now !!!!!')
+                self.fieldWorkTask:setDrivingToLoaderActive()
+                CpUtil.info('REFILL JOB: setDrivingToLoaderActive() completed')
+            else
+                CpUtil.info('REFILL JOB: Wrong task index: current=%d, fieldwork=%d', 
+                    self.currentTaskIndex, self.fieldWorkTask.taskIndex)
+            end
+        else
+            CpUtil.info('REFILL JOB: !!!!! UNKNOWN setting value: %d !!!!!', settingValue)
         end
+        CpUtil.info('===========================================')
         return false
     end
     return CpAIJob.isFinishingAllowed(self, message)

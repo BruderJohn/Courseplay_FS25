@@ -392,6 +392,10 @@ function CpAIWorker:onUpdate(dt)
         if not spec.driveStrategy then
             return
         end
+        -- Check if we have valid drive data (tX and tZ can be nil when waiting/stopped)
+        if not tX or not tZ then
+            return
+        end
         -- same as AIFieldWorker:updateAIFieldWorker(), do the actual driving
         local tY = getTerrainHeightAtWorldPos(g_currentMission.terrainRootNode, tX, 0, tZ)
         local pX, _, pZ = worldToLocal(self:getAISteeringNode(), tX, tY, tZ)

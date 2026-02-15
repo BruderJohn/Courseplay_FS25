@@ -224,7 +224,7 @@
     <text name="CP_vehicle_setting_debugActive_title" text="Fahrzeug-Debug"/>
     <text name="CP_vehicle_setting_debugActive_tooltip" text="Debuginformationen für das Fahrzeug ein- oder ausschalten. Visuell und Logeinträge."/>
     <text name="CP_vehicle_setting_refillOnTheField_title" text="Gerät auffüllen"/>
-    <text name="CP_vehicle_setting_refillOnTheField_tooltip" text="Gerät wartet auf dem Feld, um aufgefüllt zu werden."/>
+    <text name="CP_vehicle_setting_refillOnTheField_tooltip" text="Gerät wartet auf dem Feld, um aufgefüllt zu werden, oder fährt automatisch zu einem Füller am Feldrand (Aktiv)."/>
     <text name="CP_vehicle_setting_refillOnTheField_waiting" text="Warten"/>
     <text name="CP_vehicle_setting_refillOnTheField_active" text="Aktiv"/>
     <!---->

@@ -224,7 +224,7 @@
     <text name="CP_vehicle_setting_debugActive_title" text="Vehicle debug"/>
     <text name="CP_vehicle_setting_debugActive_tooltip" text="Enables/disables debug for this vehicle."/>
     <text name="CP_vehicle_setting_refillOnTheField_title" text="Refill tool"/>
-    <text name="CP_vehicle_setting_refillOnTheField_tooltip" text="Tool waits on the field to be refilled."/>
+    <text name="CP_vehicle_setting_refillOnTheField_tooltip" text="Tool waits on the field to be refilled, or automatically drives to a loader at the field edge (Active)."/>
     <text name="CP_vehicle_setting_refillOnTheField_waiting" text="Wait"/>
     <text name="CP_vehicle_setting_refillOnTheField_active" text="Active"/>
     <!---->
