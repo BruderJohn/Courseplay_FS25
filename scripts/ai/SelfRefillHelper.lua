@@ -66,6 +66,13 @@ function SelfRefillHelper:findBestLoader(fieldPolygon, myVehicle, fillTypeIndex)
                 
                 -- Check if this vehicle can provide the required fill type
                 local canRefill, dischargeNode = self:canRefillFrom(otherVehicle, myVehicle, fillTypeIndex)
+
+                if canRefill and dischargeNode and dischargeNode.node then
+                    local nx, ny, nz = getWorldTranslation(dischargeNode.node)
+                    CpUtil.debugVehicle(self.debugChannel, myVehicle,
+                        'Candidate loader %s distance %.1f m, discharge node %d world pos (%.1f, %.1f, %.1f)',
+                        otherVehicle:getName(), d, dischargeNode.index or -1, nx, ny, nz)
+                end
                 
                 if d < minDistance and canRefill then
                     bestLoader = otherVehicle
@@ -80,6 +87,13 @@ function SelfRefillHelper:findBestLoader(fieldPolygon, myVehicle, fillTypeIndex)
         CpUtil.debugVehicle(self.debugChannel, myVehicle,
                 'Best loader is %s at %.1f meters',
                 bestLoader:getName(), minDistance)
+        if bestDischargeNode and bestDischargeNode.node then
+            local dx, dy, dz = getWorldTranslation(bestDischargeNode.node)
+            local lx, ly, lz = getWorldTranslation(bestLoader.rootNode)
+            CpUtil.debugVehicle(self.debugChannel, myVehicle,
+                'Selected discharge node %d world pos (%.1f, %.1f, %.1f), loader root pos (%.1f, %.1f, %.1f)',
+                bestDischargeNode.index or -1, dx, dy, dz, lx, ly, lz)
+        end
         return bestLoader, bestDischargeNode, minDistance
     else
         CpUtil.infoVehicle(myVehicle, 'Found no loader to refill from.')
@@ -167,8 +181,15 @@ function SelfRefillHelper:getLoaderTargetParameters(fieldPolygon, myVehicle, fil
     end
     
     CpUtil.debugVehicle(CpDebug.DBG_FIELDWORK, myVehicle,
-            'Loader length: %.1f, width: %.1f, align length %.1f, offsetX %.1f',
-            loaderLength, loaderWidth, alignLength, offsetX)
+            'Loader params: length %.1f, width %.1f, alignLength %.1f, offsetX %.1f, nodeX %.1f, dZ %.1f, steeringLen %.1f, frontMarker %.1f',
+            loaderLength, loaderWidth, alignLength, offsetX, nodeX, dZ, steeringLength, frontMarkerOffset)
+
+        local tx, ty, tz = getWorldTranslation(targetNode)
+        local lx, ly, lz = getWorldTranslation(loaderRootNode)
+        local localTargetX, _, localTargetZ = localToLocal(targetNode, myVehicle:getAIDirectionNode(), 0, 0, 0)
+        CpUtil.debugVehicle(CpDebug.DBG_FIELDWORK, myVehicle,
+            'Target node world (%.1f, %.1f, %.1f), loader root world (%.1f, %.1f, %.1f), target local to vehicle (%.1f, %.1f)',
+            tx, ty, tz, lx, ly, lz, localTargetX, localTargetZ)
     
     return targetNode, alignLength, offsetX, bestLoader
 end

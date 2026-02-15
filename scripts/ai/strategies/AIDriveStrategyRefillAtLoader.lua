@@ -36,6 +36,7 @@ AIDriveStrategyRefillAtLoader.myStates = {
 -- minimum distance to drive to loader
 AIDriveStrategyRefillAtLoader.minDistanceToLoader = 5
 AIDriveStrategyRefillAtLoader.minDistanceToRefillTarget = 8
+AIDriveStrategyRefillAtLoader.minDistanceToDischargeNode = 3.5
 
 function AIDriveStrategyRefillAtLoader:init(task, job)
     AIDriveStrategyCourse.init(self, task, job)
@@ -55,6 +56,8 @@ function AIDriveStrategyRefillAtLoader:init(task, job)
     self.loaderSearchInterval = 5000  -- Retry every 5 seconds
     self.lastSearchedFillType = nil  -- Track what we're searching for
     self.targetRefillPosition = nil
+    self.refillAlignCourse = nil
+    self.refillApproachRetryCount = 0
     self.foldStartedAt = 0
     self.foldTimeoutMs = 12000
     self.nextFoldCommandAt = 0
@@ -303,24 +306,35 @@ function AIDriveStrategyRefillAtLoader:startPathfindingAfterFold()
     CpUtil.info('REFILL STRATEGY: ✓ Implements folded, now calculating path...')
     CpUtil.info('REFILL STRATEGY: Distance to loader: %.1fm', distanceToLoader)
     
-    -- Calculate precise refill position where fill and discharge nodes overlap
-    local targetX, targetZ, targetYRot = SelfRefillHelper:calculatePreciseRefillPosition(
+    local targetNode, alignLength, offsetX = SelfRefillHelper:getLoaderTargetParameters(
         fieldPolygon, self.vehicle, fillTypeIndex, self.loaderVehicle, self.dischargeNode)
-    
-    if not targetX then
-        CpUtil.info('REFILL STRATEGY: ERROR - Could not calculate precise refill position')
+
+    if not targetNode then
+        CpUtil.info('REFILL STRATEGY: ERROR - Could not calculate loader target parameters')
         CpUtil.info('REFILL STRATEGY: Falling back to waiting for manual positioning')
         self.state = self.states.WAITING_FOR_REFILL
         self.refillTimer = 0
         return
     end
-    
-    CpUtil.info('REFILL STRATEGY: Target position: (%.1f, %.1f) rotation: %.1f°', targetX, targetZ, math.deg(targetYRot))
-    self.targetRefillPosition = { x = targetX, z = targetZ, yRot = targetYRot }
-    
-    -- Create goal node at calculated position
-    local goalNode = CpUtil.createNode('refillGoal', targetX, getTerrainHeightAtWorldPos(g_currentMission.terrainRootNode, targetX, 0, targetZ), targetZ)
-    setRotation(goalNode, 0, targetYRot, 0)
+
+    CpUtil.info('REFILL STRATEGY: Target parameters: alignLength %.1f, offsetX %.1f', alignLength, offsetX)
+    local targetX, targetY, targetZ = getWorldTranslation(targetNode)
+    local vehicleX, vehicleY, vehicleZ = getWorldTranslation(self.vehicle:getAIDirectionNode())
+    local localTargetX, _, localTargetZ = localToLocal(targetNode, self.vehicle:getAIDirectionNode(), 0, 0, 0)
+    CpUtil.info('REFILL STRATEGY: Target node world: (%.1f, %.1f, %.1f)', targetX, targetY, targetZ)
+    CpUtil.info('REFILL STRATEGY: Vehicle start world: (%.1f, %.1f, %.1f), target local: (%.1f, %.1f)',
+        vehicleX, vehicleY, vehicleZ, localTargetX, localTargetZ)
+
+    -- Robust direct approach: drive to discharge node area without additional align-course offsets.
+    self.refillAlignCourse = nil
+    if self.dischargeNode and self.dischargeNode.node then
+        local dx, _, dz = getWorldTranslation(self.dischargeNode.node)
+        self.targetRefillPosition = { x = dx, z = dz }
+        CpUtil.info('REFILL STRATEGY: Direct target position from discharge node: (%.1f, %.1f)', dx, dz)
+    else
+        self.targetRefillPosition = { x = targetX, z = targetZ }
+        CpUtil.info('REFILL STRATEGY: Direct target position from target node: (%.1f, %.1f)', targetX, targetZ)
+    end
     
     -- Use PathfinderContext for pathfinding (same configuration as UnloadCombine self-unload)
     CpUtil.info('REFILL STRATEGY: Calculating path to refill position...')
@@ -356,10 +370,21 @@ function AIDriveStrategyRefillAtLoader:startPathfindingAfterFold()
     CpUtil.info('REFILL STRATEGY: Ignoring off-field penalty in 45m radius around loader')
     
     self.pathfindingStartedAt = g_currentMission.time
-    self.pathfinder, result = PathfinderUtil.startPathfindingFromVehicleToNode(
-        goalNode, 0, 0, context)
-    
-    CpUtil.destroyNode(goalNode)
+    if self.dischargeNode and self.dischargeNode.node then
+        local goalX, _, goalZ = getWorldTranslation(self.dischargeNode.node)
+        local _, goalYRot, _ = getWorldRotation(self.dischargeNode.node)
+        local goal = State3D(goalX, -goalZ, CpMathUtil.angleFromGame(goalYRot))
+        CpUtil.info('REFILL STRATEGY: Path request uses discharge world goal -> x %.2f, z %.2f, yRot %.1f',
+            goalX, goalZ, math.deg(goalYRot))
+        self.pathfinder, result = PathfinderUtil.startPathfindingFromVehicleToGoal(goal, context)
+    else
+        local approachOffsetX = 0
+        local approachOffsetZ = -2
+        CpUtil.info('REFILL STRATEGY: Path request fallback uses target node offsets -> offsetX %.2f, approachZ %.2f',
+            approachOffsetX, approachOffsetZ)
+        self.pathfinder, result = PathfinderUtil.startPathfindingFromVehicleToNode(
+            targetNode, approachOffsetX, approachOffsetZ, context)
+    end
     
     if result.done then
         -- Pathfinding completed immediately
@@ -520,6 +545,12 @@ function AIDriveStrategyRefillAtLoader:onPathfindingDoneToLoader(path)
     if path and #path > 2 then
         CpUtil.info('REFILL STRATEGY: ✓ Path calculated - %d waypoints (%d ms)',
             #path, g_currentMission.time - (self.pathfindingStartedAt or 0))
+        local first = path[1]
+        local last = path[#path]
+        if first and last and first.x and first.z and last.x and last.z then
+            CpUtil.info('REFILL STRATEGY: Path endpoints -> start (%.1f, %.1f), end (%.1f, %.1f)',
+                first.x, first.z, last.x, last.z)
+        end
         CpUtil.info('REFILL STRATEGY: >>> Driving to loader NOW <<<')
         local course = Course(self.vehicle, CpMathUtil.pointsToGameInPlace(path), true)
         self:startCourse(course, 1)
@@ -533,6 +564,13 @@ function AIDriveStrategyRefillAtLoader:onPathfindingDoneToLoader(path)
         self.state = self.states.WAITING_FOR_REFILL
         CpUtil.info('=========================================')
     end
+end
+
+function AIDriveStrategyRefillAtLoader:getDistanceToDischargeNode()
+    if self.dischargeNode and self.dischargeNode.node then
+        return calcDistanceFrom(self.vehicle:getAIDirectionNode(), self.dischargeNode.node)
+    end
+    return nil
 end
 
 function AIDriveStrategyRefillAtLoader:getDriveData(dt, vX, vY, vZ)
@@ -598,32 +636,40 @@ function AIDriveStrategyRefillAtLoader:getDriveData(dt, vX, vY, vZ)
         -- Check if we've reached the loader
         local distanceToLoader = calcDistanceFrom(self.vehicle:getAIDirectionNode(), 
             self.loaderVehicle.rootNode)
+        local distanceToDischarge = self:getDistanceToDischargeNode() or math.huge
         local distanceToTarget = math.huge
         if self.targetRefillPosition then
             local tx, _, tz = getWorldTranslation(self.vehicle:getAIDirectionNode())
             distanceToTarget = MathUtil.vector2Length(self.targetRefillPosition.x - tx, self.targetRefillPosition.z - tz)
         end
         if g_updateLoopIndex % 100 == 0 then  -- Log every ~3 seconds
-            self:debug('REFILL STRATEGY: Distance to loader: %.1fm (threshold: %.1fm), distance to target: %.1fm (threshold: %.1fm)', 
+            self:debug('REFILL STRATEGY: Distance to loader: %.1fm (threshold: %.1fm), discharge: %.1fm (threshold: %.1fm), target: %.1fm (threshold: %.1fm)', 
                 distanceToLoader, AIDriveStrategyRefillAtLoader.minDistanceToLoader,
+                distanceToDischarge, AIDriveStrategyRefillAtLoader.minDistanceToDischargeNode,
                 distanceToTarget, AIDriveStrategyRefillAtLoader.minDistanceToRefillTarget)
         end
 
         local reachedCourseEndNearTarget = self.ppc:getCourse():isCloseToLastWaypoint(5) and
             distanceToTarget < AIDriveStrategyRefillAtLoader.minDistanceToRefillTarget
+        local reachedDischargeNode = distanceToDischarge < AIDriveStrategyRefillAtLoader.minDistanceToDischargeNode
+        local reachedLoaderAsFallback = distanceToLoader < AIDriveStrategyRefillAtLoader.minDistanceToLoader and
+            distanceToDischarge < (AIDriveStrategyRefillAtLoader.minDistanceToDischargeNode + 1.5)
 
-        if distanceToLoader < AIDriveStrategyRefillAtLoader.minDistanceToLoader or reachedCourseEndNearTarget then
+        if reachedDischargeNode or reachedCourseEndNearTarget or reachedLoaderAsFallback then
             CpUtil.info('=========================================')
             CpUtil.info('REFILL STRATEGY: ✓✓✓ ARRIVED at loader!')
-            CpUtil.info('REFILL STRATEGY: Distance to loader: %.1fm, distance to target: %.1fm', distanceToLoader, distanceToTarget)
+            CpUtil.info('REFILL STRATEGY: Distance to loader: %.1fm, discharge: %.1fm, distance to target: %.1fm',
+                distanceToLoader, distanceToDischarge, distanceToTarget)
             CpUtil.info('REFILL STRATEGY: Preparing for refill...')
             self.state = self.states.WAITING_FOR_REFILL
             self.refillTimer = 0
+            self.refillApproachRetryCount = 0
             self:prepareForRefill()
             CpUtil.info('REFILL STRATEGY: Waiting for refill to complete...')
             CpUtil.info('=========================================')
         elseif self.ppc:getCourse():isCloseToLastWaypoint(5) then
-            self:debug('REFILL STRATEGY: Reached end of course but not close enough to refill target yet (%.1fm)', distanceToTarget)
+            self:debug('REFILL STRATEGY: Reached end of course but not close enough (discharge %.1fm, target %.1fm)',
+                distanceToDischarge, distanceToTarget)
         end
         
     elseif self.state == self.states.WAITING_FOR_LOADER then
@@ -683,6 +729,21 @@ function AIDriveStrategyRefillAtLoader:updateRefilling(dt)
         self:finishRefilling()
         CpUtil.info('=========================================')
         return
+    end
+
+    -- If no refill happens and we are still too far from the actual discharge node,
+    -- recalculate approach once or twice before timing out.
+    if not self.refillSucceeded and self.refillTimer > 5000 and
+        self.refillApproachRetryCount < 2 and self.targetLoaderData then
+        local distanceToDischarge = self:getDistanceToDischargeNode() or math.huge
+        if distanceToDischarge > (AIDriveStrategyRefillAtLoader.minDistanceToDischargeNode + 1.0) then
+            self.refillApproachRetryCount = self.refillApproachRetryCount + 1
+            CpUtil.info('REFILL STRATEGY: No refill detected and still %.1fm from discharge node, recalculating approach (retry %d/2)',
+                distanceToDischarge, self.refillApproachRetryCount)
+            self.state = self.states.DRIVING_TO_LOADER_PATHFINDING
+            self:startPathfindingAfterFold()
+            return
+        end
     end
     
     -- Check for timeout
@@ -744,27 +805,47 @@ function AIDriveStrategyRefillAtLoader:finishRefilling()
 end
 
 function AIDriveStrategyRefillAtLoader:isRefillingComplete()
-    -- Check all fill units to see if they are sufficiently filled
-    local fillUnits = self.vehicle:getFillUnits()
-    if not fillUnits then
-        return false
-    end
-    
+    -- Only check fill units that were explicitly registered for refilling by implement controllers.
+    -- This avoids false positives from unrelated vehicle tanks (diesel/DEF/etc.).
     local hasAnyRelevantUnit = false
     local allRelevantUnitsFilled = true
-    
-    for fillUnitIndex, fillUnit in pairs(fillUnits) do
-        local capacity = self.vehicle:getFillUnitCapacity(fillUnitIndex)
-        if capacity and capacity > 100 then -- Only check units with significant capacity
-            hasAnyRelevantUnit = true
-            local fillLevelPercent = self.vehicle:getFillUnitFillLevelPercentage(fillUnitIndex)
-            if fillLevelPercent < 0.95 then -- Consider filled at 95%
-                allRelevantUnitsFilled = false
-                self:debugSparse('Fill unit %d at %.1f percent', fillUnitIndex, fillLevelPercent * 100)
+
+    local function isFuelType(fillType)
+        return fillType == FillType.DIESEL or
+               fillType == FillType.ELECTRICCHARGE or
+               fillType == FillType.METHANE or
+               fillType == FillType.DEF
+    end
+
+    if not self.controllers then
+        return false
+    end
+
+    for _, controller in pairs(self.controllers) do
+        local refillData = controller.refillData
+        if refillData and refillData.lastFillLevels then
+            for implement, data in pairs(refillData.lastFillLevels) do
+                for fillUnitIndex, _ in pairs(data) do
+                    local capacity = implement:getFillUnitCapacity(fillUnitIndex)
+                    if capacity and capacity > 0 then
+                        local fillType = implement:getFillUnitFillType(fillUnitIndex)
+                        if fillType ~= FillType.UNKNOWN and not isFuelType(fillType) then
+                            hasAnyRelevantUnit = true
+                            local fillLevel = implement:getFillUnitFillLevel(fillUnitIndex)
+                            local fillLevelPercent = capacity > 0 and (fillLevel / capacity) or 0
+                            if fillLevelPercent < 0.95 then
+                                allRelevantUnitsFilled = false
+                                self:debugSparse('Refill unit %s:%d at %.1f percent (%.0f/%.0f)',
+                                    CpUtil.getName(implement), fillUnitIndex, fillLevelPercent * 100, fillLevel, capacity)
+                            end
+                        end
+                    end
+                end
             end
         end
     end
-    
+
+    -- Never complete immediately if we could not identify any refill-relevant unit.
     return hasAnyRelevantUnit and allRelevantUnitsFilled
 end
 
