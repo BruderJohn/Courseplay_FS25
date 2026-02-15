@@ -398,14 +398,28 @@ function CpAITaskFieldWork:start()
 end
 
 function CpAITaskFieldWork:stop(wasJobStopped)
-	if self.waitingForRefillingActive then
+	local wasWaitingForRefilling = self.waitingForRefillingActive
+
+	-- Always clear temporary refill/hold states first, especially when stopping mid-refill.
+	self.waitingForFieldBoundary = false
+	self.drivingToLoaderActive = false
+
+	if wasWaitingForRefilling then
 		local cpSpec = self.vehicle.spec_cpAIFieldWorker
 		cpSpec.driveStrategy:raiseControllerEvent(
 				AIDriveStrategyCourse.onStopRefillingEvent)
 	end
+	self.waitingForRefillingActive = false
+
+	if self.refillStrategy and self.refillStrategy.finishRefilling then
+		self.refillStrategy:finishRefilling()
+	end
+	self.refillStrategy = nil
 	if self.isServer then
 		self:debug("Field work task stopped.")
 		self.vehicle:stopFieldWorker()
+		-- Important: stop and delete CP drive strategy as well to release any active hold/freeze states.
+		self.vehicle:stopCpDriver(wasJobStopped)
 		self.vehicle:cpBrakeToStop()
 	end
 	CpAITask.stop(self, wasJobStopped)

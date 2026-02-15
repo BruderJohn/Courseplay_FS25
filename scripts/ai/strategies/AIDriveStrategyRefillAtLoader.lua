@@ -891,8 +891,68 @@ function AIDriveStrategyRefillAtLoader:isRefillingComplete()
         end
     end
 
-    -- Never complete immediately if we could not identify any refill-relevant unit.
-    return hasAnyRelevantUnit and allRelevantUnitsFilled
+    if hasAnyRelevantUnit then
+        return allRelevantUnitsFilled
+    end
+
+    -- Fallback: some setups do not populate controller refillData consistently.
+    -- In that case, evaluate real refill-capable units directly on vehicle + attached implements.
+    local requiredFillType = self:getRequiredFillType()
+    if not requiredFillType then
+        return false
+    end
+
+    local function unitSupportsRequiredFillType(object, fillUnitIndex)
+        local fillType = object:getFillUnitFillType(fillUnitIndex)
+        if fillType == requiredFillType then
+            return true
+        end
+        if fillType == FillType.UNKNOWN and object.getFillUnitSupportedFillTypes then
+            local supportedFillTypes = object:getFillUnitSupportedFillTypes(fillUnitIndex)
+            return supportedFillTypes ~= nil and supportedFillTypes[requiredFillType] == true
+        end
+        return false
+    end
+
+    local fallbackHasRelevantUnit = false
+    local fallbackAllRelevantUnitsFilled = true
+
+    local function evaluateObject(object)
+        if not object or not object.getFillUnits then
+            return
+        end
+        local fillUnits = object:getFillUnits()
+        if not fillUnits then
+            return
+        end
+
+        for fillUnitIndex, _ in pairs(fillUnits) do
+            local capacity = object:getFillUnitCapacity(fillUnitIndex)
+            if capacity and capacity > 0 and unitSupportsRequiredFillType(object, fillUnitIndex) then
+                fallbackHasRelevantUnit = true
+                local fillLevel = object:getFillUnitFillLevel(fillUnitIndex)
+                local fillLevelPercent = fillLevel / capacity
+                if fillLevelPercent < 0.95 then
+                    fallbackAllRelevantUnitsFilled = false
+                    self:debugSparse('Fallback refill unit %s:%d at %.1f percent (%.0f/%.0f)',
+                        CpUtil.getName(object), fillUnitIndex, fillLevelPercent * 100, fillLevel, capacity)
+                end
+            end
+        end
+    end
+
+    evaluateObject(self.vehicle)
+    for _, implement in pairs(self.vehicle:getAttachedAIImplements()) do
+        if implement and implement.object then
+            evaluateObject(implement.object)
+        end
+    end
+
+    if fallbackHasRelevantUnit and fallbackAllRelevantUnitsFilled then
+        self:debug('REFILL STRATEGY: Fallback completion detection confirmed all relevant units >= 95%%')
+    end
+
+    return fallbackHasRelevantUnit and fallbackAllRelevantUnitsFilled
 end
 
 --- Get the fill type that the vehicle needs to refill
