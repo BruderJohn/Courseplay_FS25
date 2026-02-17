@@ -233,6 +233,17 @@ function CpAITaskFieldWork:update(dt)
 			return  -- Continue waiting without stopping job
 		end
 		
+		-- Check if we're waiting for implements to fold
+		if self.refillStrategy and self.refillStrategy.state == self.refillStrategy.states.WAITING_FOR_FOLD then
+			-- Just wait, vehicle is stopped and implements are folding
+			-- Don't stop the job, let it continue waiting
+			self.vehicle:setCpInfoTextActive(InfoTextManager.NEEDS_FILLING)
+			if g_updateLoopIndex % 100 == 0 then  -- Every ~3 seconds
+				self:debug('REFILL: Waiting for implements to fold completely...')
+			end
+			return  -- Continue waiting without stopping job
+		end
+		
 		-- Check if refill strategy has finished
 		if self.refillStrategy and self.refillStrategy.state == self.refillStrategy.states.REFILL_COMPLETE then
 			self:debug('=========================================')

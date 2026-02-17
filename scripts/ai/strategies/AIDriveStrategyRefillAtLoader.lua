@@ -15,7 +15,8 @@ GNU General Public License for more details.
 You should have received a copy of the GNU General Public License
 along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-Drive strategy for driving to a loader/filler vehicle and refilling.
+Drive strategy for driving to a loader/filler vehicle (slurry tanker) and refilling.
+Uses pathfinder approach similar to combine unloader strategy.
 
 ]]--
 
@@ -23,49 +24,141 @@ Drive strategy for driving to a loader/filler vehicle and refilling.
 ---@field job CpAIJobFieldWork
 AIDriveStrategyRefillAtLoader = CpObject(AIDriveStrategyCourse)
 
+-- Target offset similar to unloader: don't end right at discharge node, leave some distance
+AIDriveStrategyRefillAtLoader.refillTargetOffset = 1.5
+
+-- Distance thresholds for determining when we've reached the loader
+AIDriveStrategyRefillAtLoader.minDistanceToLoader = 15  -- Distance to loader vehicle itself (meters)
+AIDriveStrategyRefillAtLoader.minDistanceToDischargeNode = 8  -- Distance to discharge node (refill point, meters)
+AIDriveStrategyRefillAtLoader.minDistanceToRefillTarget = 3  -- Distance to calculated target position (meters)
+
 AIDriveStrategyRefillAtLoader.myStates = {
     SEARCHING_FOR_LOADER = {},
     WAITING_FOR_LOADER = {},
-    WAITING_FOR_FOLD = {},  -- Warten bis Implements zusammengeklappt sind
-    DRIVING_TO_LOADER_PATHFINDING = {},
+    WAITING_FOR_FOLD = {},
+    WAITING_FOR_PATHFINDER = {},
     DRIVING_TO_LOADER = {},
     WAITING_FOR_REFILL = {},
     REFILL_COMPLETE = {},
 }
-
--- minimum distance to drive to loader
-AIDriveStrategyRefillAtLoader.minDistanceToLoader = 5
-AIDriveStrategyRefillAtLoader.minDistanceToRefillTarget = 8
-AIDriveStrategyRefillAtLoader.minDistanceToDischargeNode = 3.5
 
 function AIDriveStrategyRefillAtLoader:init(task, job)
     AIDriveStrategyCourse.init(self, task, job)
     AIDriveStrategyCourse.initStates(self, AIDriveStrategyRefillAtLoader.myStates)
     self.state = self.states.SEARCHING_FOR_LOADER
     self.debugChannel = CpDebug.DBG_FIELDWORK
+    
     self.refillTimer = 0
     self.refillTimeout = 30000 -- 30 seconds timeout for refilling
     self.loaderVehicle = nil
     self.dischargeNode = nil
-    self.implementsRaised = false
-    self.startCalled = false  -- Track if start() has been called
-    self.fieldPolygon = nil  -- Will be set by task
-    self.islandPolygons = nil
-    self.pathfindingStartedAt = 0  -- Track when pathfinding started
-    self.loaderSearchTimer = 0  -- Timer for retrying loader search
-    self.loaderSearchInterval = 5000  -- Retry every 5 seconds
-    self.lastSearchedFillType = nil  -- Track what we're searching for
-    self.targetRefillPosition = nil
+    self.refillTargetNode = nil
     self.refillAlignCourse = nil
-    self.refillApproachNode = nil
-    self.refillApproachRetryCount = 0
-    self.foldStartedAt = 0
-    self.foldTimeoutMs = 12000
-    self.nextFoldCommandAt = 0
-    self.foldCommandRetryMs = 1500
-    self.nextFoldTimeoutLogAt = 0
+    self.implementsRaised = false
+    
+    self.fieldPolygon = nil
+    self.loaderSearchTimer = 0
+    self.loaderSearchInterval = 5000
+    self.lastSearchedFillType = nil
+    self.refillSucceeded = false
+    self.startCalled = false
+    
+    -- Folding management
+    self.foldStartTime = nil
+    self.foldTimeout = 30000  -- 30 seconds max wait for folding
+    self.foldCommandRetryMs = 2000  -- Retry fold command every 2 seconds
+    self.nextFoldCommandAt = 0  -- Time when next fold command should be sent
 end
 
+function AIDriveStrategyRefillAtLoader:delete()
+    if self.refillTargetNode then
+        CpUtil.destroyNode(self.refillTargetNode)
+        self.refillTargetNode = nil
+    end
+    AIDriveStrategyCourse.delete(self)
+end
+
+function AIDriveStrategyRefillAtLoader:initializeImplementControllers(vehicle)
+    self:addImplementController(vehicle, MotorController, Motorized, {})
+    self:addImplementController(vehicle, WearableController, Wearable, {})
+    self:addImplementController(vehicle, FoldableController, Foldable, {})
+    self:addImplementController(vehicle, PickupController, Pickup, {})
+    self:addImplementController(vehicle, CutterController, Cutter, {})
+    self:addImplementController(vehicle, SowingMachineController, SowingMachine, {})
+end
+
+function AIDriveStrategyRefillAtLoader:setAIVehicle(vehicle, jobParameters)
+    AIDriveStrategyCourse.setAIVehicle(self, vehicle, jobParameters)
+    self:raiseImplements()
+end
+
+--- Set the field polygon to use for finding loaders
+---@param fieldPolygon table [{x, y, z}] field boundary vertices
+function AIDriveStrategyRefillAtLoader:setFieldPolygon(fieldPolygon, islandPolygons)
+    self.fieldPolygon = fieldPolygon
+    self.islandPolygons = islandPolygons
+    self:debug('Field polygon set with %d vertices', fieldPolygon and #fieldPolygon or 0)
+end
+
+function AIDriveStrategyRefillAtLoader:start()
+    if self.startCalled then
+        return
+    end
+    self.startCalled = true
+    
+    self:debug('Starting refill at loader strategy')
+    self.refillSucceeded = false
+    
+    local fieldPolygon = self.fieldPolygon
+    if not fieldPolygon or #fieldPolygon == 0 then
+        self:debug('ERROR: No field polygon available, cannot search for loader')
+        self.state = self.states.REFILL_COMPLETE
+        return
+    end
+    
+    -- Get required fill type
+    local fillTypeIndex = self:getRequiredFillType()
+    if not fillTypeIndex then
+        self:debug('ERROR: Could not determine required fill type')
+        self.state = self.states.REFILL_COMPLETE
+        return
+    end
+    
+    local fillTypeName = g_fillTypeManager:getFillTypeNameByIndex(fillTypeIndex)
+    self:debug('Required fill type: %s (index %d)', fillTypeName, fillTypeIndex)
+    
+    -- Find loader
+    self.loaderVehicle, self.dischargeNode = SelfRefillHelper:findBestLoader(fieldPolygon, self.vehicle, fillTypeIndex)
+    
+    if not self.loaderVehicle then
+        self:debug('No loader found yet, entering waiting state')
+        self.state = self.states.WAITING_FOR_LOADER
+        self.loaderSearchTimer = 0
+        self.lastSearchedFillType = fillTypeIndex
+        return
+    end
+    
+    self:debug('Loader found: %s', CpUtil.getName(self.loaderVehicle))
+    
+    -- Check distance to loader
+    local distanceToLoader = calcDistanceFrom(self.vehicle:getAIDirectionNode(), self.loaderVehicle.rootNode)
+    self:debug('Distance to loader: %.1f meters', distanceToLoader)
+    
+    -- If very close already (within 10m), skip pathfinding and start refilling
+    if distanceToLoader < 10 then
+        self:debug('Vehicle is already close to loader, starting refill directly')
+        self.state = self.states.WAITING_FOR_REFILL
+        self.refillTimer = 0
+        self:prepareForRefill()
+        return
+    end
+    
+    -- Need pathfinding to reach loader - first fold implements
+    self:debug('Vehicle is %.1fm away, folding implements first...', distanceToLoader)
+    self:startFoldingForPathfinding()
+end
+
+--- Send fold command to a single object (vehicle or implement)
 function AIDriveStrategyRefillAtLoader:requestFoldForObject(object)
     if not object then
         return
@@ -96,6 +189,7 @@ function AIDriveStrategyRefillAtLoader:requestFoldForObject(object)
     end
 end
 
+--- Send fold commands to vehicle and all attached implements
 function AIDriveStrategyRefillAtLoader:requestFoldAllForRefill()
     self:debug('REFILL FOLD: sending fold commands to vehicle and attached implements')
     self:requestFoldForObject(self.vehicle)
@@ -141,420 +235,130 @@ function AIDriveStrategyRefillAtLoader:areFoldablesReadyForPathfinding()
     return true
 end
 
-function AIDriveStrategyRefillAtLoader:delete()
-    if self.refillApproachNode then
-        CpUtil.destroyNode(self.refillApproachNode)
-        self.refillApproachNode = nil
-    end
-    AIDriveStrategyCourse.delete(self)
-end
-
-function AIDriveStrategyRefillAtLoader:initializeImplementControllers(vehicle)
-    self:addImplementController(vehicle, MotorController, Motorized, {})
-    self:addImplementController(vehicle, WearableController, Wearable, {})
-    self:addImplementController(vehicle, FoldableController, Foldable, {})
-    self:addImplementController(vehicle, PickupController, Pickup, {})
-    self:addImplementController(vehicle, CutterController, Cutter, {})
-    self:addImplementController(vehicle, SowingMachineController, SowingMachine, {})
-end
-
-function AIDriveStrategyRefillAtLoader:setAIVehicle(vehicle, jobParameters)
-    AIDriveStrategyCourse.setAIVehicle(self, vehicle, jobParameters)
-    -- Raise implements before starting to drive to loader
-    self:raiseImplements()
-    -- Start will be called later in the update cycle
-end
-
---- Set the field polygon to use for finding loaders
----@param fieldPolygon table [{x, y, z}] field boundary vertices
----@param islandPolygons table|nil [[{x, y, z}]] array of island polygons
-function AIDriveStrategyRefillAtLoader:setFieldPolygon(fieldPolygon, islandPolygons)
-    self:debug('!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!')
-    self:debug('setFieldPolygon() CALLED')
-    self:debug('fieldPolygon parameter is: %s', fieldPolygon and 'NOT NIL' or 'NIL')
-    if fieldPolygon then
-        self:debug('fieldPolygon has %d vertices', #fieldPolygon)
-        for i = 1, math.min(3, #fieldPolygon) do
-            self:debug('  Vertex %d: x=%.1f, z=%.1f', i, fieldPolygon[i].x, fieldPolygon[i].z)
-        end
-    end
-    self:debug('!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!')
-    
-    self.fieldPolygon = fieldPolygon
-    self.islandPolygons = islandPolygons
-    
-    self:debug('After assignment: self.fieldPolygon is %s', self.fieldPolygon and 'NOT NIL' or 'NIL')
-end
-
-function AIDriveStrategyRefillAtLoader:start()
-    -- Prevent multiple calls to start()
-    if self.startCalled then
-        return
-    end
-    self.startCalled = true
-    
-    CpUtil.info('=========================================')
-    CpUtil.info('REFILL STRATEGY: Starting refill at loader')
-    CpUtil.info('REFILL STRATEGY: Checking field polygon...')
-    
-    self.refillSucceeded = false  -- Track if refill actually worked
-    
-    -- Use the field polygon passed from the task, not from vehicle
-    local fieldPolygon = self.fieldPolygon
-    
-    if fieldPolygon then
-        CpUtil.info('REFILL STRATEGY: ✓ Field polygon available with %d vertices', #fieldPolygon)
-        for i = 1, math.min(3, #fieldPolygon) do
-            CpUtil.info('REFILL STRATEGY:   Vertex %d: x=%.1f, z=%.1f', i, fieldPolygon[i].x, fieldPolygon[i].z)
-        end
-    else
-        CpUtil.info('REFILL STRATEGY: !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!')
-        CpUtil.info('REFILL STRATEGY: CRITICAL ERROR - No field polygon available')
-        CpUtil.info('REFILL STRATEGY: Cannot search for loader without field boundary')
-        CpUtil.info('REFILL STRATEGY: !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!')
-        CpUtil.info('REFILL STRATEGY: ')
-        CpUtil.info('REFILL STRATEGY: POSSIBLE SOLUTIONS:')
-        CpUtil.info('REFILL STRATEGY:   1. Stop Courseplay and start again')
-        CpUtil.info('REFILL STRATEGY:   2. Manually drive to tanker for refilling')
-        CpUtil.info('REFILL STRATEGY:   3. Wait 30 seconds for automatic retry')
-        CpUtil.info('REFILL STRATEGY: ')
-        CpUtil.info('REFILL STRATEGY: The vehicle will STOP')
-        CpUtil.info('REFILL STRATEGY: !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!')
-        self.state = self.states.REFILL_COMPLETE
-        return
-    end
-    
-    -- Get the fill type we need
-    CpUtil.info('REFILL STRATEGY: Determining required fill type...')
-    local fillTypeIndex = self:getRequiredFillType()
-    if not fillTypeIndex then
-        CpUtil.info('REFILL STRATEGY: ERROR - Could not determine required fill type')
-        CpUtil.info('REFILL STRATEGY: Check if vehicle has a sprayer/manure spreader attached')
-        self.state = self.states.REFILL_COMPLETE
-        return
-    end
-    local fillTypeName = g_fillTypeManager:getFillTypeNameByIndex(fillTypeIndex)
-    CpUtil.info('REFILL STRATEGY: ✓ Required fill type: %s (index %d)', fillTypeName, fillTypeIndex)
-    
-    -- Find the best loader
-    CpUtil.info('REFILL STRATEGY: Searching for loader within 30m of field edge...')
-    self.loaderVehicle, self.dischargeNode = SelfRefillHelper:findBestLoader(fieldPolygon, self.vehicle, fillTypeIndex)
-    
-    if not self.loaderVehicle then
-        CpUtil.info('REFILL STRATEGY: !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!')
-        CpUtil.info('REFILL STRATEGY: WARNING - No suitable loader found yet!')
-        CpUtil.info('REFILL STRATEGY: !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!')
-        CpUtil.info('REFILL STRATEGY: ')
-        CpUtil.info('REFILL STRATEGY: CHECKLIST:')
-        CpUtil.info('REFILL STRATEGY:   □ Tanker is within 30m of field edge')
-        CpUtil.info('REFILL STRATEGY:   □ Tanker is STOPPED (not moving)')
-        CpUtil.info('REFILL STRATEGY:   □ Tanker is NOT controlled by Courseplay')
-        CpUtil.info('REFILL STRATEGY:   □ Tanker contains: %s', fillTypeName)
-        CpUtil.info('REFILL STRATEGY:   □ Tanker has at least 100 liters')
-        CpUtil.info('REFILL STRATEGY: ')
-        CpUtil.info('REFILL STRATEGY: Vehicle will WAIT and search every 5 seconds')
-        CpUtil.info('REFILL STRATEGY: Place a suitable tanker to continue automatically')
-        CpUtil.info('REFILL STRATEGY: !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!')
-        self.state = self.states.WAITING_FOR_LOADER
-        self.loaderSearchTimer = 0
-        self.lastSearchedFillType = fillTypeIndex
-        return
-    end
-    
-    local x, y, z = getWorldTranslation(self.loaderVehicle.rootNode)
-    CpUtil.info('REFILL STRATEGY: ✓✓✓ SUCCESS - Loader found!')
-    CpUtil.info('REFILL STRATEGY: Loader: %s', CpUtil.getName(self.loaderVehicle))
-    CpUtil.info('REFILL STRATEGY: Position: %.1f, %.1f, %.1f', x, y, z)
-    
-    -- Check distance to loader
-    local vx, vy, vz = getWorldTranslation(self.vehicle.rootNode)
-    local distanceToLoader = math.sqrt((x - vx)^2 + (z - vz)^2)
-    CpUtil.info('REFILL STRATEGY: Distance to loader: %.1f meters', distanceToLoader)
-    
-    -- If very close already (within 30m), skip pathfinding and start refilling immediately
-    if distanceToLoader < 30 then
-        CpUtil.info('REFILL STRATEGY: ✓ Vehicle is already close to loader!')
-        CpUtil.info('REFILL STRATEGY: Skipping pathfinding, starting refill directly')
-        CpUtil.info('=========================================')
-        self.state = self.states.WAITING_FOR_REFILL
-        self.refillTimer = 0
-        self:prepareForRefill()
-        return
-    end
-    
-    -- Vehicle is far away, need to calculate path
-    CpUtil.info('REFILL STRATEGY: Vehicle is %.1fm away, need to fold implements first...', distanceToLoader)
-    CpUtil.info('REFILL STRATEGY: >>> Folding implements (Schleppschlauch etc.) for better pathfinding <<<')
-    
-    -- WICHTIG: Implements zusammenklappen BEVOR Pfad berechnet wird
+--- Start folding implements before pathfinding
+function AIDriveStrategyRefillAtLoader:startFoldingForPathfinding()
+    self:debug('Starting to fold implements for pathfinding...')
     self:raiseImplements()
     self:requestFoldAllForRefill()
+    
     self.state = self.states.WAITING_FOR_FOLD
-    self.foldStartedAt = g_currentMission.time
-    self.targetLoaderData = {
-        fieldPolygon = fieldPolygon,
-        fillTypeIndex = fillTypeIndex,
-        distanceToLoader = distanceToLoader
-    }
-    CpUtil.info('REFILL STRATEGY: Waiting for implements to fold...')
-    CpUtil.info('=========================================')
-    return
+    self.foldStartTime = g_currentMission.time
+    self:debug('Waiting for implements to fold completely...')
 end
 
---- Start pathfinding after implements are folded
-function AIDriveStrategyRefillAtLoader:startPathfindingAfterFold()
-    local fieldPolygon = self.targetLoaderData.fieldPolygon
-    local fillTypeIndex = self.targetLoaderData.fillTypeIndex
-    local distanceToLoader = self.targetLoaderData.distanceToLoader
-    
-    CpUtil.info('=========================================')
-    CpUtil.info('REFILL STRATEGY: ✓ Implements folded, now calculating path...')
-    CpUtil.info('REFILL STRATEGY: Distance to loader: %.1fm', distanceToLoader)
-    
-    -- Erstelle manuellen Pfad (Bogen-Gerade-Bogen-Gerade) statt Pathfinder
-    local waypoints = self:createManualRefillPath()
-    
-    if not waypoints or #waypoints < 2 then
-        CpUtil.info('REFILL STRATEGY: ERROR - Could not create manual refill path')
-        CpUtil.info('REFILL STRATEGY: Falling back to waiting for manual positioning')
-        self.state = self.states.WAITING_FOR_REFILL
-        self.refillTimer = 0
+--- Start pathfinding to the loader (similar to unloader approach)
+function AIDriveStrategyRefillAtLoader:startPathfindingToLoader()
+    if self.pathfinder and self.pathfinder:isActive() then
+        self:debug('Pathfinder already active')
         return
     end
     
-    -- Speichere Zielposition vom letzten Waypoint
-    local lastWp = waypoints[#waypoints]
-    self.targetRefillPosition = { x = lastWp.x, z = lastWp.z }
-    CpUtil.info('REFILL STRATEGY: Target position: (%.1f, %.1f)', lastWp.x, lastWp.z)
+    -- Get target parameters
+    local targetNode, alignLength, offsetX, loaderVehicle = self:getRefillTargetParameters()
+    if not targetNode then
+        self:debug('Could not get refill target parameters')
+        self.state = self.states.REFILL_COMPLETE
+        return
+    end
     
-    -- Erstelle Course aus den Waypoints
-    CpUtil.info('REFILL STRATEGY: Creating course from %d waypoints...', #waypoints)
-    local course = Course(self.vehicle, waypoints, true)
-    course:enrichWaypointData()
+    self.refillTargetNode = targetNode
+    self.loaderVehicle = loaderVehicle
     
-    CpUtil.info('REFILL STRATEGY: >>> Starting drive to loader NOW <<<')
-    self:startCourse(course, 1)
-    self.state = self.states.DRIVING_TO_LOADER
-    self.ppc:disableStopWhenOffTrack(15000)
-    CpUtil.info('=========================================')
+    -- Create alignment course (straight section parallel to loader)
+    self:debug('Creating align course relative to target node from %.1f to %.1f',
+            -alignLength + 1, -self.refillTargetOffset)
+    self.refillAlignCourse = Course.createFromNode(self.vehicle, self.refillTargetNode,
+            offsetX, -alignLength + 1,
+            -self.refillTargetOffset,
+            1, false)
+    
+    self.state = self.states.WAITING_FOR_PATHFINDER
+    
+    local fieldNum = CpFieldUtil.getFieldNumUnderVehicle(self.vehicle)
+    local context = PathfinderContext(self.vehicle)
+    
+    -- Configure pathfinding context (similar to unloader)
+    context:maxFruitPercent(100)  -- Slurry tankers can drive through crops
+    context:offFieldPenalty(PathfinderContext.defaultOffFieldPenalty)
+    context:mustBeAccurate(true)  -- Need precise positioning for refill
+    context:useFieldNum(fieldNum)
+    context:allowReverse(self:getAllowReversePathfinding())
+    
+    -- Ignore off-field penalty around the loader to allow bridging gap between field and loader
+    context:areaToIgnoreOffFieldPenalty(
+            PathfinderUtil.NodeArea.createVehicleArea(self.loaderVehicle, 1.5 * SelfRefillHelper.maxDistanceFromField))
+    
+    context:maxIterations(PathfinderUtil.getMaxIterationsForFieldPolygon(self.vehicle:cpGetFieldPolygon()))
+    
+    self.pathfinderController:registerListeners(self,
+            self.onPathfindingDoneToLoader,
+            self.onPathfindingFailedToLoader,
+            self.onPathfindingObstacleAtStart)
+    
+    self.pathfinderController:findPathToNode(context, self.refillTargetNode, offsetX, -alignLength, 3)
+    
+    self:debug('Pathfinding started to loader')
 end
 
---- Erstellt einen manuellen Pfad zum Auflader aus Bögen und Geraden
---- Pfad besteht aus: Bogen -> Gerade -> Bogen -> Gerade (parallel zum Auflader)
-function AIDriveStrategyRefillAtLoader:createManualRefillPath()
-    CpUtil.info('=========================================')
-    CpUtil.info('REFILL STRATEGY: Erstelle manuellen Refill-Pfad (Bogen-Gerade-Bogen-Gerade)')
-    
-    -- Hole Fahrzeugposition und Richtung
-    local vehicleX, vehicleY, vehicleZ = getWorldTranslation(self.vehicle:getAIDirectionNode())
-    local _, vehicleYRot, _ = getWorldRotation(self.vehicle:getAIDirectionNode())
-    CpUtil.info('REFILL STRATEGY: Fahrzeugposition: (%.1f, %.1f, %.1f), Richtung: %.1f°', 
-        vehicleX, vehicleY, vehicleZ, math.deg(vehicleYRot))
-    
-    -- Hole Aufladerposition und Richtung
-    if not self.loaderVehicle or not self.dischargeNode then
-        CpUtil.info('REFILL STRATEGY: FEHLER - Kein Auflader oder Discharge Node vorhanden')
-        return nil
+--- Get target parameters for refill (delegated to SelfRefillHelper)
+function AIDriveStrategyRefillAtLoader:getRefillTargetParameters()
+    local fillTypeIndex = self.lastSearchedFillType or self:getRequiredFillType()
+    return SelfRefillHelper:getLoaderTargetParameters(
+            self.vehicle:cpGetFieldPolygon(),
+            self.vehicle,
+            fillTypeIndex,
+            self.loaderVehicle,
+            self.dischargeNode)
+end
+
+--- Callback when pathfinding to loader is done
+function AIDriveStrategyRefillAtLoader:onPathfindingDoneToLoader(controller, success, course, goalNodeInvalid)
+    if success then
+        self:debug('Pathfinding successful, %d waypoints', course and #course or 0)
+        course:append(self.refillAlignCourse)
+        self.state = self.states.DRIVING_TO_LOADER
+        self:startCourse(course, 1)
+        return true
+    else
+        self:debug('Pathfinding failed, stopping job')
+        self.vehicle:stopCurrentAIJob(AIMessageCpErrorNoPathFound.new())
+        return false
     end
+end
+
+--- Callback when pathfinding fails
+function AIDriveStrategyRefillAtLoader:onPathfindingFailedToLoader(controller, lastContext, wasLastRetry,
+                                                                    currentRetryAttempt, trailerCollisionsOnly,
+                                                                    fruitPenaltyNodePercent, offFieldPenaltyNodePercent)
+    local offFieldPenaltyRelaxingSteps = { 0.5, 0.25, 0.1}
     
-    local loaderX, loaderY, loaderZ = getWorldTranslation(self.loaderVehicle.rootNode)
-    local _, loaderYRot, _ = getWorldRotation(self.loaderVehicle.rootNode)
-    local dischargeX, dischargeY, dischargeZ = getWorldTranslation(self.dischargeNode.node)
-    
-    CpUtil.info('REFILL STRATEGY: Auflader Position: (%.1f, %.1f, %.1f), Richtung: %.1f°', 
-        loaderX, loaderY, loaderZ, math.deg(loaderYRot))
-    CpUtil.info('REFILL STRATEGY: Discharge Node: (%.1f, %.1f, %.1f)', 
-        dischargeX, dischargeY, dischargeZ)
-    
-    -- Berechne Turning Radius
-    local turningRadius = AIUtil.getTurningRadius(self.vehicle)
-    if not turningRadius or turningRadius < 5 then
-        turningRadius = 8  -- Mindest-Radius
-    end
-    CpUtil.info('REFILL STRATEGY: Turning Radius: %.1f m', turningRadius)
-    
-    -- Erstelle Waypoints-Array
-    local waypoints = {}
-    local waypointStep = 1.5  -- Abstand zwischen Waypoints
-    
-    -- ============================================================================
-    -- Berechne Zielgeometrie (Endposition 20m hinter dem Discharge Node)
-    -- ============================================================================
-    
-    -- Richtung vom Auflader zum Discharge Node
-    local loaderToDischargeX = dischargeX - loaderX
-    local loaderToDischargeZ = dischargeZ - loaderZ
-    local loaderToDischargeLength = math.sqrt(loaderToDischargeX * loaderToDischargeX + loaderToDischargeZ * loaderToDischargeZ)
-    
-    if loaderToDischargeLength < 0.1 then
-        CpUtil.info('REFILL STRATEGY: FEHLER - Auflader und Discharge Node zu nah beieinander')
-        return nil
-    end
-    
-    local loaderDirX = loaderToDischargeX / loaderToDischargeLength
-    local loaderDirZ = loaderToDischargeZ / loaderToDischargeLength
-    
-    -- Finale Fahrtrichtung (parallel zum Auflader, in Richtung Discharge Node)
-    local finalYRot = math.atan2(loaderDirX, loaderDirZ)
-    
-    -- Seitlicher Versatz (rechtwinklig zur Laderichtung)
-    local sideOffset = 6  -- 6m seitlich versetzt
-    local behindDistance = 20  -- 20m hinter dem Discharge Node
-    
-    -- Berechne seitliche Richtung (90° gedreht)
-    local sideDirX = -loaderDirZ
-    local sideDirZ = loaderDirX
-    
-    -- Startpunkt der finalen parallelen Gerade (20m hinter Discharge Node, seitlich versetzt)
-    local parallelStartX = dischargeX - loaderDirX * behindDistance + sideDirX * sideOffset
-    local parallelStartZ = dischargeZ - loaderDirZ * behindDistance + sideDirZ * sideOffset
-    
-    CpUtil.info('REFILL STRATEGY: Parallele Anfahrt Start: (%.1f, %.1f)', parallelStartX, parallelStartZ)
-    CpUtil.info('REFILL STRATEGY: Finale Richtung: %.1f°', math.deg(finalYRot))
-    
-    -- ============================================================================
-    -- Rückwärtsplanung: Starte vom Ziel und arbeite zum Fahrzeug zurück
-    -- ============================================================================
-    
-    -- Berechne Fahrtrichtung vom Fahrzeug grob in Richtung Ziel
-    local vehicleToTargetX = parallelStartX - vehicleX
-    local vehicleToTargetZ = parallelStartZ - vehicleZ
-    local distanceToTarget = math.sqrt(vehicleToTargetX * vehicleToTargetX + vehicleToTargetZ * vehicleToTargetZ)
-    
-    if distanceToTarget < 2 * turningRadius then
-        CpUtil.info('REFILL STRATEGY: WARNUNG - Zu nah am Ziel, verwende einfachen direkten Pfad')
-        -- Erstelle einfachen direkten Pfad
-        local steps = math.ceil(distanceToTarget / waypointStep)
-        for i = 0, steps do
-            local t = i / steps
-            local wpX = vehicleX + vehicleToTargetX * t
-            local wpZ = vehicleZ + vehicleToTargetZ * t
-            table.insert(waypoints, { x = wpX, z = wpZ })
+    if not wasLastRetry then
+        -- Relax off-field penalty and retry
+        if offFieldPenaltyRelaxingSteps[currentRetryAttempt] then
+            self:debug('Pathfinding failed, relaxing off-field penalty to %.2f and retrying',
+                    offFieldPenaltyRelaxingSteps[currentRetryAttempt])
+            lastContext:offFieldPenalty(offFieldPenaltyRelaxingSteps[currentRetryAttempt] * PathfinderContext.defaultOffFieldPenalty)
         end
-        table.insert(waypoints, { x = dischargeX, z = dischargeZ })
-        return waypoints
+        controller:retry(lastContext)
+    else
+        -- All retries exhausted
+        self:debug('Pathfinding failed after all retries')
+        self.vehicle:stopCurrentAIJob(AIMessageCpErrorNoPathFound.new())
     end
-    
-    -- Bestimme Abbiegewinkel (positiv = links, negativ = rechts)
-    local angleDiff = CpMathUtil.getDeltaAngle(finalYRot, vehicleYRot)
-    local turnDirection = angleDiff > 0 and 1 or -1  -- 1 = links, -1 = rechts
-    local totalTurnAngle = math.abs(angleDiff)
-    
-    -- Begrenze auf maximal 180°
-    if totalTurnAngle > math.pi then
-        totalTurnAngle = 2 * math.pi - totalTurnAngle
-        turnDirection = -turnDirection
+end
+
+--- Callback when obstacle is detected at start
+function AIDriveStrategyRefillAtLoader:onPathfindingObstacleAtStart(controller, lastContext, maxDistance,
+                                                                     trailerCollisionsOnly, fruitPenaltyNodePercent,
+                                                                     offFieldPenaltyNodePercent)
+    if trailerCollisionsOnly then
+        self:debug('Pathfinding detected obstacle at start (trailer collisions only), ignoring')
+        lastContext:ignoreTrailerAtStartRange(1.5 * self.turningRadius)
+        controller:retry(lastContext)
+    else
+        self:debug('Pathfinding detected obstacle at start, cannot proceed')
+        self.vehicle:stopCurrentAIJob(AIMessageCpErrorNoPathFound.new())
     end
-    
-    -- Teile Total Turn Angle auf zwei Bögen auf (z.B. je 50%)
-    local arc1Angle = totalTurnAngle * 0.5
-    local arc2Angle = totalTurnAngle * 0.5
-    
-    CpUtil.info('REFILL STRATEGY: Gesamtwinkel: %.1f°, Richtung: %s', 
-        math.deg(totalTurnAngle), turnDirection > 0 and 'links' or 'rechts')
-    CpUtil.info('REFILL STRATEGY: Bogen 1: %.1f°, Bogen 2: %.1f°', 
-        math.deg(arc1Angle), math.deg(arc2Angle))
-    
-    -- ============================================================================
-    -- SEGMENT 1: Erster Bogen vom Fahrzeug
-    -- ============================================================================
-    local arc1Steps = math.ceil((arc1Angle * turningRadius) / waypointStep)
-    local arc1AngleStep = arc1Angle / arc1Steps
-    
-    -- Bogenmittelpunkt
-    local arc1CenterX = vehicleX - math.sin(vehicleYRot) * turningRadius * turnDirection
-    local arc1CenterZ = vehicleZ - math.cos(vehicleYRot) * turningRadius * turnDirection
-    
-    -- Erstelle Waypoints für ersten Bogen
-    for i = 0, arc1Steps do
-        local angle = vehicleYRot + (i * arc1AngleStep * turnDirection)
-        local wpX = arc1CenterX + math.sin(angle) * turningRadius * turnDirection
-        local wpZ = arc1CenterZ + math.cos(angle) * turningRadius * turnDirection
-        table.insert(waypoints, { x = wpX, z = wpZ })
-    end
-    
-    local arc1EndX = waypoints[#waypoints].x
-    local arc1EndZ = waypoints[#waypoints].z
-    local arc1EndAngle = vehicleYRot + (arc1Angle * turnDirection)
-    
-    CpUtil.info('REFILL STRATEGY: Bogen 1 Ende: (%.1f, %.1f), Winkel: %.1f°', 
-        arc1EndX, arc1EndZ, math.deg(arc1EndAngle))
-    
-    -- ============================================================================
-    -- SEGMENT 2: Gerade zwischen den Bögen
-    -- ============================================================================
-    -- Berechne benötigte Länge der Geraden basierend auf verbleibender Distanz
-    local remainingX = parallelStartX - arc1EndX
-    local remainingZ = parallelStartZ - arc1EndZ
-    local remainingDist = math.sqrt(remainingX * remainingX + remainingZ * remainingZ)
-    
-    -- Abzug für zweiten Bogen (ungefähr)
-    local arc2Length = arc2Angle * turningRadius
-    local straightDistance = math.max(10, remainingDist - arc2Length - 2 * turningRadius)
-    
-    local straight1DirX = math.sin(arc1EndAngle)
-    local straight1DirZ = math.cos(arc1EndAngle)
-    
-    local straight1Steps = math.ceil(straightDistance / waypointStep)
-    for i = 1, straight1Steps do
-        local wpX = arc1EndX + straight1DirX * i * waypointStep
-        local wpZ = arc1EndZ + straight1DirZ * i * waypointStep
-        table.insert(waypoints, { x = wpX, z = wpZ })
-    end
-    
-    local straight1EndX = waypoints[#waypoints].x
-    local straight1EndZ = waypoints[#waypoints].z
-    
-    CpUtil.info('REFILL STRATEGY: Gerade Ende: (%.1f, %.1f), Länge: %.1f m', 
-        straight1EndX, straight1EndZ, straightDistance)
-    
-    -- ============================================================================
-    -- SEGMENT 3: Zweiter Bogen zur parallelen Endrichtung
-    -- ============================================================================
-    local arc2Steps = math.ceil((arc2Angle * turningRadius) / waypointStep)
-    local arc2AngleStep = arc2Angle / arc2Steps
-    
-    -- Bogenmittelpunkt
-    local arc2CenterX = straight1EndX - math.sin(arc1EndAngle) * turningRadius * turnDirection
-    local arc2CenterZ = straight1EndZ - math.cos(arc1EndAngle) * turningRadius * turnDirection
-    
-    -- Erstelle Waypoints für zweiten Bogen (zurück zur Zielrichtung)
-    for i = 1, arc2Steps do
-        local angle = arc1EndAngle + (i * arc2AngleStep * -turnDirection)
-        local wpX = arc2CenterX + math.sin(angle) * turningRadius * turnDirection
-        local wpZ = arc2CenterZ + math.cos(angle) * turningRadius * turnDirection
-        table.insert(waypoints, { x = wpX, z = wpZ })
-    end
-    
-    local arc2EndX = waypoints[#waypoints].x
-    local arc2EndZ = waypoints[#waypoints].z
-    
-    CpUtil.info('REFILL STRATEGY: Bogen 2 Ende: (%.1f, %.1f)', arc2EndX, arc2EndZ)
-    
-    -- ============================================================================
-    -- SEGMENT 4: Finale Gerade parallel zum Auflader
-    -- ============================================================================
-    local finalDistX = dischargeX - arc2EndX
-    local finalDistZ = dischargeZ - arc2EndZ
-    local finalDistance = math.sqrt(finalDistX * finalDistX + finalDistZ * finalDistZ)
-    
-    local finalStraightSteps = math.ceil(finalDistance / waypointStep)
-    
-    CpUtil.info('REFILL STRATEGY: Finale Gerade - Distanz: %.1f m', finalDistance)
-    
-    for i = 1, finalStraightSteps do
-        local wpX = arc2EndX + loaderDirX * i * waypointStep
-        local wpZ = arc2EndZ + loaderDirZ * i * waypointStep
-        table.insert(waypoints, { x = wpX, z = wpZ })
-    end
-    
-    -- Füge finalen Waypoint bei Discharge Node hinzu
-    table.insert(waypoints, { x = dischargeX, z = dischargeZ })
-    
-    CpUtil.info('REFILL STRATEGY: ✓ Manueller Pfad erstellt mit %d Waypoints', #waypoints)
-    CpUtil.info('=========================================')
-    
-    return waypoints
 end
 
 function AIDriveStrategyRefillAtLoader:update(dt)
@@ -570,32 +374,33 @@ function AIDriveStrategyRefillAtLoader:update(dt)
         self:start()
     end
     
-    -- Warten bis Implements zusammengeklappt sind
-    if self.state == self.states.WAITING_FOR_FOLD then
-        self:setMaxSpeed(0)
-        if g_currentMission.time >= (self.nextFoldCommandAt or 0) then
-            self:requestFoldAllForRefill()
-        end
-        local foldReady = self:areFoldablesReadyForPathfinding()
-        local timedOut = (g_currentMission.time - (self.foldStartedAt or 0)) > self.foldTimeoutMs
-
-        if foldReady then
-            -- Implements sind jetzt zusammengeklappt, jetzt Pathfinding starten
-            self:startPathfindingAfterFold()
-        elseif timedOut then
-            if g_currentMission.time >= (self.nextFoldTimeoutLogAt or 0) then
-                CpUtil.info('REFILL STRATEGY: Fold wait timeout reached, still waiting for complete fold animation')
-                self.nextFoldTimeoutLogAt = g_currentMission.time + 5000
-            end
-        else
-            self:debugSparse('Waiting for implements to fold completely before pathfinding...')
-        end
-        return  -- Nicht weiter updaten während Falten
-    end
-    
     -- Handle waiting for loader to appear
     if self.state == self.states.WAITING_FOR_LOADER then
         self:updateWaitingForLoader(dt)
+    end
+    
+    -- Handle waiting for implements to fold
+    if self.state == self.states.WAITING_FOR_FOLD then
+        -- Periodically resend fold commands in case some implements didn't respond
+        if g_currentMission.time >= self.nextFoldCommandAt then
+            self:debug('REFILL FOLD: Resending fold commands...')
+            self:requestFoldAllForRefill()
+        end
+        
+        local foldingComplete = self:areFoldablesReadyForPathfinding()
+        local timeoutReached = (g_currentMission.time - (self.foldStartTime or 0)) > self.foldTimeout
+        
+        if foldingComplete then
+            self:debug('Implements folded successfully, starting pathfinding now')
+            self:startPathfindingToLoader()
+        elseif timeoutReached then
+            self:debug('WARNING: Fold timeout reached, starting pathfinding anyway')
+            self:startPathfindingToLoader()
+        else
+            if g_updateLoopIndex % 100 == 0 then
+                self:debug('Waiting for implements to fold...')
+            end
+        end
     end
 
     -- Keep PPC off-track auto-stop disabled while navigating the generated refill approach path.
@@ -660,57 +465,18 @@ function AIDriveStrategyRefillAtLoader:updateWaitingForLoader(dt)
                 self:prepareForRefill()
                 return
             end
-            
             -- Vehicle is far away, need to calculate path
-            CpUtil.info('REFILL STRATEGY: Vehicle is %.1fm away, folding implements first...', distanceToLoader)
-            CpUtil.info('REFILL STRATEGY: >>> Folding implements for better pathfinding <<<')
+            CpUtil.info('REFILL STRATEGY: Vehicle is %.1fm away, starting pathfinding...', distanceToLoader)
+            CpUtil.info('REFILL STRATEGY: >>> Starting pathfinding to loader <<<')
             
-            -- WICHTIG: Implements zusammenklappen BEVOR Pfad berechnet wird
-            self:raiseImplements()
-            self:requestFoldAllForRefill()
-            self.state = self.states.WAITING_FOR_FOLD
-            self.foldStartedAt = g_currentMission.time
-            self.targetLoaderData = {
-                fieldPolygon = fieldPolygon,
-                fillTypeIndex = fillTypeIndex,
-                distanceToLoader = distanceToLoader
-            }
-            CpUtil.info('REFILL STRATEGY: Waiting for implements to fold...')
+            -- Start pathfinding
+            self:startPathfindingToLoader()
             CpUtil.info('=========================================')
         else
             -- Still no loader found
             CpUtil.info('REFILL STRATEGY: Still no loader found, waiting...')
             CpUtil.info('=========================================')
         end
-    end
-end
-
---- Callback for when pathfinding to loader completes
-function AIDriveStrategyRefillAtLoader:onPathfindingDoneToLoader(path)
-    if path and #path > 2 then
-        CpUtil.info('REFILL STRATEGY: ✓ Path calculated - %d waypoints (%d ms)',
-            #path, g_currentMission.time - (self.pathfindingStartedAt or 0))
-        local first = path[1]
-        local last = path[#path]
-        if first and last and first.x and first.z and last.x and last.z then
-            CpUtil.info('REFILL STRATEGY: Path endpoints -> start (%.1f, %.1f), end (%.1f, %.1f)',
-                first.x, first.z, last.x, last.z)
-        end
-        CpUtil.info('REFILL STRATEGY: >>> Driving to loader NOW <<<')
-        local course = Course(self.vehicle, CpMathUtil.pointsToGameInPlace(path), true)
-        if self.refillAlignCourse then
-            course:append(self.refillAlignCourse)
-        end
-        self:startCourse(course, 1)
-        self.state = self.states.DRIVING_TO_LOADER
-        self.ppc:disableStopWhenOffTrack(15000)
-        CpUtil.info('=========================================')
-    else
-        CpUtil.info('REFILL STRATEGY: WARNING - Could not find path to loader')
-        CpUtil.info('REFILL STRATEGY: Path length: %d', path and #path or 0)
-        CpUtil.info('REFILL STRATEGY: Waiting at current position for manual help')
-        self.state = self.states.WAITING_FOR_REFILL
-        CpUtil.info('=========================================')
     end
 end
 
@@ -752,20 +518,27 @@ function AIDriveStrategyRefillAtLoader:getDriveData(dt, vX, vY, vZ)
             self:raiseImplements()
             self.implementsRaised = true
         end
+        -- Stop and wait at current position
+        self:setMaxSpeed(0)
+        gx, gz = vX, vZ
         
     elseif self.state == self.states.WAITING_FOR_FOLD then
         -- Stop and wait while implements are folding
-        -- WICHTIG: Fahrzeug komplett anhalten während Implements zusammenklappen
         self:setMaxSpeed(0)
-        gx, gz = vX, vZ  -- Aktuelle Position als Ziel (nicht bewegen!)
-        moveForwards = true
+        gx, gz = vX, vZ
         if not self.implementsRaised then
             self:raiseImplements()
             self.implementsRaised = true
         end
-        -- Explizit zurückgeben um weitere Verarbeitung zu vermeiden
-        self:checkProximitySensors(moveForwards)
-        return gx, gz, moveForwards, 0, 100  -- Geschwindigkeit = 0!
+        
+    elseif self.state == self.states.WAITING_FOR_PATHFINDER then
+        -- Stop and wait while pathfinder is calculating route
+        self:setMaxSpeed(0)
+        gx, gz = vX, vZ
+        if not self.implementsRaised then
+            self:raiseImplements()
+            self.implementsRaised = true
+        end
         
     elseif self.state == self.states.DRIVING_TO_LOADER then
         -- The generated loader approach path can contain larger transitions and temporary crosstrack spikes,
@@ -887,13 +660,13 @@ function AIDriveStrategyRefillAtLoader:updateRefilling(dt)
     -- If no refill happens and we are still too far from the actual discharge node,
     -- recalculate approach once or twice before timing out.
     if not self.refillSucceeded and self.refillTimer > 5000 and
-        self.refillApproachRetryCount < 2 and self.targetLoaderData then
+        self.refillApproachRetryCount < 2 then
         local distanceToDischarge = self:getDistanceToDischargeNode() or math.huge
         if distanceToDischarge > (AIDriveStrategyRefillAtLoader.minDistanceToDischargeNode + 1.0) then
             self.refillApproachRetryCount = self.refillApproachRetryCount + 1
             CpUtil.info('REFILL STRATEGY: No refill detected and still %.1fm from discharge node, recalculating approach (retry %d/2)',
                 distanceToDischarge, self.refillApproachRetryCount)
-            self:startPathfindingAfterFold()
+            self:startPathfindingToLoader()
             return
         end
     end
