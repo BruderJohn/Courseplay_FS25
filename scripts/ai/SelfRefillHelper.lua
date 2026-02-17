@@ -168,7 +168,7 @@ function SelfRefillHelper:getLoaderTargetParameters(fieldPolygon, myVehicle, fil
     
     -- Calculate approach parameters similar to trailer unloading
     -- Position vehicle beside the discharge node to receive liquid
-    local offsetX = math.max(3.0, loaderWidth / 2) + (myVehicle.size.width / 2) + 1.5
+    local offsetX = math.max(2.0, loaderWidth / 2) + (myVehicle.size.width / 2) + 0.5
     
     -- Determine which side to approach from based on discharge node position
     local nodeX, _, _ = localToLocal(targetNode, loaderRootNode, 0, 0, 0)

@@ -80,7 +80,7 @@ local function processSprayerArea(sprayer, superFunc, ...)
                     CpUtil.info('=========================================')
                     CpUtil.info('SPRAYER: Stopping CP - tank almost empty!')
                     CpUtil.info('SPRAYER: Fill level: %.1f%% (threshold: %.1f%%)', 
-                        (fillLevel / capacity) * 100, stopThresholdPercentage)
+                        capacity > 0 and (fillLevel / capacity) * 100 or 0, stopThresholdPercentage)
                     CpUtil.info('SPRAYER: Capacity: %.1f liters, Remaining: %.1f liters', capacity, fillLevel)
                     CpUtil.info('SPRAYER: Vehicle: %s', CpUtil.getName(rootVehicle))
                     CpUtil.info('SPRAYER: Calling stopCurrentAIJob with AIMessageErrorOutOfFill')

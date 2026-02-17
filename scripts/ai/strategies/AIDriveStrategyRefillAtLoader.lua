@@ -25,12 +25,12 @@ Uses pathfinder approach similar to combine unloader strategy.
 AIDriveStrategyRefillAtLoader = CpObject(AIDriveStrategyCourse)
 
 -- Target offset similar to unloader: don't end right at discharge node, leave some distance
-AIDriveStrategyRefillAtLoader.refillTargetOffset = 1.5
+AIDriveStrategyRefillAtLoader.refillTargetOffset = 0.5
 
 -- Distance thresholds for determining when we've reached the loader
 AIDriveStrategyRefillAtLoader.minDistanceToLoader = 15  -- Distance to loader vehicle itself (meters)
-AIDriveStrategyRefillAtLoader.minDistanceToDischargeNode = 8  -- Distance to discharge node (refill point, meters)
-AIDriveStrategyRefillAtLoader.minDistanceToRefillTarget = 3  -- Distance to calculated target position (meters)
+AIDriveStrategyRefillAtLoader.minDistanceToDischargeNode = 5  -- Distance to discharge node (refill point, meters)
+AIDriveStrategyRefillAtLoader.minDistanceToRefillTarget = 2  -- Distance to calculated target position (meters)
 
 AIDriveStrategyRefillAtLoader.myStates = {
     SEARCHING_FOR_LOADER = {},
