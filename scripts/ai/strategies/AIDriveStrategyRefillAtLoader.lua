@@ -63,18 +63,51 @@ function AIDriveStrategyRefillAtLoader:init(task, job)
     self.refillSucceeded = false
     self.startCalled = false
     
+    -- Cleanup tracking
+    self.dischargeCleaned = false
+    
     -- Folding management
     self.foldStartTime = nil
     self.foldTimeout = 30000  -- 30 seconds max wait for folding
     self.foldCommandRetryMs = 2000  -- Retry fold command every 2 seconds
     self.nextFoldCommandAt = 0  -- Time when next fold command should be sent
+    
+    -- Debug tracking
+    self.lastStateChange = g_currentMission.time
+    self.lastDebugUpdate = 0
 end
 
 function AIDriveStrategyRefillAtLoader:delete()
-    if self.refillTargetNode then
-        CpUtil.destroyNode(self.refillTargetNode)
-        self.refillTargetNode = nil
+    -- Ensure discharge cleanup happens during strategy deletion
+    CpUtil.info('DEBUG: delete() called for refill strategy')
+    
+    -- Extra safety: Turn off discharge state one more time before deletion
+    if self.vehicle and self.vehicle.spec_dischargeable then
+        if self.vehicle.setDischargeState then
+            self.vehicle:setDischargeState(Dischargeable.DISCHARGE_STATE_OFF, true)
+            CpUtil.info('DEBUG: Pre-delete discharge OFF for vehicle')
+        end
     end
+    if self.vehicle then
+        for _, implement in pairs(self.vehicle:getAttachedImplements()) do
+            local object = implement.object
+            if object and object.spec_dischargeable and object.setDischargeState then
+                object:setDischargeState(Dischargeable.DISCHARGE_STATE_OFF, true)
+                CpUtil.info('DEBUG: Pre-delete discharge OFF for implement')
+            end
+        end
+    end
+    
+    self:cleanupDischargeState()
+    
+    -- Don't destroy refillTargetNode - it's a reference to the loader's discharge node, not ours!
+    -- Just clear the reference
+    self.refillTargetNode = nil
+    
+    -- Clear references to avoid entity access errors
+    self.loaderVehicle = nil
+    self.dischargeNode = nil
+    CpUtil.info('DEBUG: delete() completed')
     AIDriveStrategyCourse.delete(self)
 end
 
@@ -88,8 +121,10 @@ function AIDriveStrategyRefillAtLoader:initializeImplementControllers(vehicle)
 end
 
 function AIDriveStrategyRefillAtLoader:setAIVehicle(vehicle, jobParameters)
+    CpUtil.info('DEBUG: setAIVehicle called for %s', CpUtil.getName(vehicle))
     AIDriveStrategyCourse.setAIVehicle(self, vehicle, jobParameters)
     self:raiseImplements()
+    CpUtil.info('DEBUG: setAIVehicle completed')
 end
 
 --- Set the field polygon to use for finding loaders
@@ -130,6 +165,14 @@ function AIDriveStrategyRefillAtLoader:start()
     -- Find loader
     self.loaderVehicle, self.dischargeNode = SelfRefillHelper:findBestLoader(fieldPolygon, self.vehicle, fillTypeIndex)
     
+    CpUtil.info('DEBUG: Loader search result - vehicle: %s, dischargeNode: %s', 
+        self.loaderVehicle and CpUtil.getName(self.loaderVehicle) or 'nil',
+        self.dischargeNode and tostring(self.dischargeNode.node) or 'nil')
+    
+    if self.loaderVehicle then
+        CpUtil.info('DEBUG: Found loader with entity ID: %s', tostring(self.loaderVehicle.rootNode))
+    end
+    
     if not self.loaderVehicle then
         self:debug('No loader found yet, entering waiting state')
         self.state = self.states.WAITING_FOR_LOADER
@@ -141,16 +184,21 @@ function AIDriveStrategyRefillAtLoader:start()
     self:debug('Loader found: %s', CpUtil.getName(self.loaderVehicle))
     
     -- Check distance to loader
-    local distanceToLoader = calcDistanceFrom(self.vehicle:getAIDirectionNode(), self.loaderVehicle.rootNode)
-    self:debug('Distance to loader: %.1f meters', distanceToLoader)
-    
-    -- If very close already (within 10m), skip pathfinding and start refilling
-    if distanceToLoader < 10 then
-        self:debug('Vehicle is already close to loader, starting refill directly')
-        self.state = self.states.WAITING_FOR_REFILL
-        self.refillTimer = 0
-        self:prepareForRefill()
-        return
+    local distanceToLoader = math.huge  -- Default fallback value
+    if self.loaderVehicle and self.loaderVehicle.rootNode then
+        distanceToLoader = calcDistanceFrom(self.vehicle:getAIDirectionNode(), self.loaderVehicle.rootNode)
+        self:debug('Distance to loader: %.1f meters', distanceToLoader)
+        
+        -- If very close already (within 10m), skip pathfinding and start refilling
+        if distanceToLoader < 10 then
+            self:debug('Vehicle is already close to loader, starting refill directly')
+            self.state = self.states.WAITING_FOR_REFILL
+            self.refillTimer = 0
+            self:prepareForRefill()
+            return
+        end
+    else
+        self:debug('Cannot calculate distance to loader (missing rootNode)')
     end
     
     -- Need pathfinding to reach loader - first fold implements
@@ -285,8 +333,10 @@ function AIDriveStrategyRefillAtLoader:startPathfindingToLoader()
     context:allowReverse(self:getAllowReversePathfinding())
     
     -- Ignore off-field penalty around the loader to allow bridging gap between field and loader
-    context:areaToIgnoreOffFieldPenalty(
-            PathfinderUtil.NodeArea.createVehicleArea(self.loaderVehicle, 1.5 * SelfRefillHelper.maxDistanceFromField))
+    if self.loaderVehicle then
+        context:areaToIgnoreOffFieldPenalty(
+                PathfinderUtil.NodeArea.createVehicleArea(self.loaderVehicle, 1.5 * SelfRefillHelper.maxDistanceFromField))
+    end
     
     context:maxIterations(PathfinderUtil.getMaxIterationsForFieldPolygon(self.vehicle:cpGetFieldPolygon()))
     
@@ -506,8 +556,53 @@ function AIDriveStrategyRefillAtLoader:getDistanceToDischargeNode()
     return nil
 end
 
+--- Indicates whether this strategy has completed its work
+---@return boolean true when refilling is complete and strategy should finish
+function AIDriveStrategyRefillAtLoader:isDone()
+    local done = self.state == self.states.REFILL_COMPLETE and self.refillSucceeded
+    if done then
+        CpUtil.info('DEBUG: isDone() returning true - strategy complete')
+    end
+    return done
+end
+
 function AIDriveStrategyRefillAtLoader:getDriveData(dt, vX, vY, vZ)
     self:updateLowFrequencyImplementControllers()
+    
+    -- Debug status reporting every 10 seconds 
+    if g_currentMission.time > self.lastDebugUpdate + 10000 then
+        self.lastDebugUpdate = g_currentMission.time
+        CpUtil.info('DEBUG STATUS: State=%s, RefillComplete=%s, DischargeCleaned=%s, LoaderVehicle=%s', 
+            self:getStateAsString(), 
+            tostring(self.state == self.states.REFILL_COMPLETE),
+            tostring(self.dischargeCleaned),
+            self.loaderVehicle and CpUtil.getName(self.loaderVehicle) or 'nil')
+        
+        -- Check for problematic discharge references
+        if self.vehicle and self.vehicle.spec_dischargeable then
+            local spec = self.vehicle.spec_dischargeable
+            if spec.currentDischargeNode and spec.currentDischargeNode.dischargeObject then
+                CpUtil.info('DEBUG WARNING: Vehicle still has discharge object: %s', 
+                    tostring(spec.currentDischargeNode.dischargeObject))
+            end
+            if spec.dischargeNodes then
+                for i, node in pairs(spec.dischargeNodes) do
+                    if node.dischargeObject then
+                        CpUtil.info('DEBUG WARNING: Discharge node %d still has object: %s', 
+                            i, tostring(node.dischargeObject))
+                    end
+                end
+            end
+        end
+    end
+    
+    -- Early detection and cleanup
+    if g_updateLoopIndex % 10 == 0 then  -- Check every 10th update for early completion detection
+        if self:isDone() and not self.dischargeCleaned then
+            CpUtil.info('DEBUG: Strategy done but discharge not cleaned - emergency cleanup!')
+            self:cleanupDischargeState()
+        end
+    end
     
     local moveForwards = not self.ppc:isReversing()
     local gx, gz
@@ -560,8 +655,11 @@ function AIDriveStrategyRefillAtLoader:getDriveData(dt, vX, vY, vZ)
         end
         
         -- Check if we've reached the loader
-        local distanceToLoader = calcDistanceFrom(self.vehicle:getAIDirectionNode(), 
-            self.loaderVehicle.rootNode)
+        local distanceToLoader = math.huge
+        if self.loaderVehicle and self.loaderVehicle.rootNode then
+            distanceToLoader = calcDistanceFrom(self.vehicle:getAIDirectionNode(), 
+                self.loaderVehicle.rootNode)
+        end
         local distanceToDischarge = self:getDistanceToDischargeNode() or math.huge
         local distanceToTarget = math.huge
         if self.targetRefillPosition then
@@ -620,6 +718,17 @@ function AIDriveStrategyRefillAtLoader:getDriveData(dt, vX, vY, vZ)
     elseif self.state == self.states.REFILL_COMPLETE then
         self:setMaxSpeed(0)
         gx, gz = 0, 0
+        -- Ensure immediate cleanup when entering complete state
+        if not self.dischargeCleaned then
+            CpUtil.info('DEBUG: REFILL_COMPLETE state - calling cleanup...')
+            self:cleanupDischargeState()
+            self.dischargeCleaned = true
+        end
+        
+        -- CONTINUOUS MONITORING: Check for lingering discharge references every 5 updates
+        if g_updateLoopIndex % 5 == 0 then
+            self:monitorDischargeReferences()
+        end
     end
     
     self:checkProximitySensors(moveForwards)
@@ -646,14 +755,22 @@ function AIDriveStrategyRefillAtLoader:updateRefilling(dt)
     
     -- Check if refilling is complete
     if self:isRefillingComplete() then
-        CpUtil.info('=========================================')
+        CpUtil.info('===========================================')
         CpUtil.info('REFILL STRATEGY: ✓✓✓ REFILLING COMPLETE!')
         CpUtil.info('REFILL STRATEGY: Tank is now at 95%% or higher')
         CpUtil.info('REFILL STRATEGY: Returning to fieldwork...')
+        CpUtil.info('DEBUG: About to call finishRefilling...')
         self.refillSucceeded = true  -- Ensure flag is set
         self.state = self.states.REFILL_COMPLETE
         self:finishRefilling()
-        CpUtil.info('=========================================')
+        -- Immediate cleanup to prevent entity errors
+        if not self.dischargeCleaned then
+            CpUtil.info('DEBUG: Discharge not yet cleaned, calling cleanup...')
+            self:cleanupDischargeState()
+        else
+            CpUtil.info('DEBUG: Discharge already cleaned')
+        end
+        CpUtil.info('===========================================')
         return
     end
 
@@ -686,6 +803,10 @@ function AIDriveStrategyRefillAtLoader:updateRefilling(dt)
         CpUtil.info('=========================================')
         self.state = self.states.REFILL_COMPLETE
         self:finishRefilling()
+        -- Immediate cleanup to prevent entity errors
+        if not self.dischargeCleaned then
+            self:cleanupDischargeState()
+        end
         return
     end
     
@@ -717,16 +838,419 @@ function AIDriveStrategyRefillAtLoader:prepareForRefill()
     end
 end
 
+--- Clean up discharge state to prevent entity access errors
+function AIDriveStrategyRefillAtLoader:cleanupDischargeState()
+    if self.dischargeCleaned then
+        CpUtil.info('DEBUG: cleanupDischargeState() - Already cleaned up, skipping')
+        return  -- Already cleaned up
+    end
+    
+    CpUtil.info('===========================================')
+    CpUtil.info('DEBUG: Starting discharge state cleanup...')
+    CpUtil.info('DEBUG: Vehicle: %s', CpUtil.getName(self.vehicle))
+    self.dischargeCleaned = true
+    
+    -- STEP 1: Turn OFF discharge state FIRST to prevent game from accessing entities
+    CpUtil.info('DEBUG: Step 1 - Turning OFF discharge states...')
+    if self.vehicle and self.vehicle.spec_dischargeable then
+        if self.vehicle.setDischargeState then
+            self.vehicle:setDischargeState(Dischargeable.DISCHARGE_STATE_OFF, true)
+            CpUtil.info('DEBUG: Vehicle discharge state set to OFF')
+        end
+    end
+    
+    -- Also turn OFF for all implements
+    if self.vehicle then
+        for i, implement in pairs(self.vehicle:getAttachedImplements()) do
+            local object = implement.object
+            if object and object.spec_dischargeable then
+                if object.setDischargeState then
+                    object:setDischargeState(Dischargeable.DISCHARGE_STATE_OFF, true)
+                    CpUtil.info('DEBUG: Implement %d discharge state set to OFF', i)
+                end
+            end
+        end
+    end
+    
+    -- STEP 2: Now clear all entity references
+    CpUtil.info('DEBUG: Step 2 - Clearing entity references...')
+    
+    -- Reset discharge state to prevent entity access errors
+    if self.vehicle and self.vehicle.spec_dischargeable then
+        local spec = self.vehicle.spec_dischargeable
+        CpUtil.info('DEBUG: Vehicle has dischargeable spec')
+        
+        -- Clear any cached discharge targets
+        if spec.currentDischargeNode then
+            CpUtil.info('DEBUG: Found currentDischargeNode, clearing discharge references...')
+            CpUtil.info('DEBUG: Before cleanup - dischargeObject: %s, dischargeFillUnitIndex: %s', 
+                tostring(spec.currentDischargeNode.dischargeObject), 
+                tostring(spec.currentDischargeNode.dischargeFillUnitIndex))
+            spec.currentDischargeNode.dischargeObject = nil
+            spec.currentDischargeNode.dischargeFillUnitIndex = nil 
+            spec.currentDischargeNode.dischargeHit = false
+            
+            -- NUCLEAR: Clear ALL possible cached references including node IDs
+            spec.currentDischargeNode.dischargeObjectInfo = nil
+            spec.currentDischargeNode.dischargeTargetObject = nil
+            spec.currentDischargeNode.lastDischargeObject = nil
+            spec.currentDischargeNode.dischargeFailedReason = nil
+            spec.currentDischargeNode.dischargeFailedReasonShown = nil
+            spec.currentDischargeNode.dischargeFailedObjectId = nil
+            spec.currentDischargeNode.lastDischargeObjectId = nil
+            spec.currentDischargeNode.dischargeHitObject = nil
+            spec.currentDischargeNode.dischargeHitObjectUnitIndex = nil
+            spec.currentDischargeNode.dischargeHitObjectId = nil
+            spec.currentDischargeNode.dischargeHitTerrain = nil
+            spec.currentDischargeNode.lastDischargeDistanceCheck = nil
+            
+            if spec.currentDischargeNode.raycastInfo then
+                spec.currentDischargeNode.raycastInfo.hitObject = nil
+                spec.currentDischargeNode.raycastInfo.hitObjectId = nil
+                spec.currentDischargeNode.raycastInfo.hitTerrain = nil
+            end
+            
+            CpUtil.info('DEBUG: currentDischargeNode cleared')
+        else
+            CpUtil.info('DEBUG: No currentDischargeNode found')
+        end
+        
+        -- Clear discharge node discharge objects to prevent stale references
+        if spec.dischargeNodes then
+            CpUtil.info('DEBUG: Found %d discharge nodes, clearing all...', #spec.dischargeNodes)
+            for i, dischargeNode in pairs(spec.dischargeNodes) do
+                if dischargeNode.dischargeObject then
+                    CpUtil.info('DEBUG: Node %d had dischargeObject %s, clearing...', i, tostring(dischargeNode.dischargeObject))
+                end
+                dischargeNode.dischargeObject = nil
+                dischargeNode.dischargeFillUnitIndex = nil
+                dischargeNode.dischargeHit = false
+                
+                -- NUCLEAR: Clear ALL possible cached references including node IDs
+                dischargeNode.dischargeObjectInfo = nil
+                dischargeNode.dischargeTargetObject = nil
+                dischargeNode.lastDischargeObject = nil
+                dischargeNode.dischargeFailedReason = nil
+                dischargeNode.dischargeFailedReasonShown = nil
+                dischargeNode.dischargeFailedObjectId = nil
+                dischargeNode.lastDischargeObjectId = nil
+                dischargeNode.dischargeHitObject = nil
+                dischargeNode.dischargeHitObjectUnitIndex = nil
+                dischargeNode.dischargeHitObjectId = nil
+                dischargeNode.dischargeHitTerrain = nil
+                dischargeNode.lastDischargeDistanceCheck = nil
+                
+                if dischargeNode.raycastInfo then
+                    dischargeNode.raycastInfo.hitObject = nil
+                    dischargeNode.raycastInfo.hitObjectId = nil
+                    dischargeNode.raycastInfo.hitTerrain = nil
+                end
+            end
+            CpUtil.info('DEBUG: All discharge nodes cleared')
+        else
+            CpUtil.info('DEBUG: No discharge nodes found')
+        end
+    else
+        CpUtil.info('DEBUG: Vehicle has no dischargeable spec')
+    end
+    
+    -- Also check implements for discharge state
+    if self.vehicle then
+        local implements = self.vehicle:getAttachedImplements()
+        CpUtil.info('DEBUG: Checking %d attached implements...', #implements)
+        for i, implement in pairs(implements) do
+            local object = implement.object
+            if object and object.spec_dischargeable then
+                CpUtil.info('DEBUG: Implement %d (%s) has dischargeable spec', i, CpUtil.getName(object))
+                local spec = object.spec_dischargeable
+                if spec.currentDischargeNode then
+                    CpUtil.info('DEBUG: Implement %d currentDischargeNode - dischargeObject: %s', i,
+                        tostring(spec.currentDischargeNode.dischargeObject))
+                    spec.currentDischargeNode.dischargeObject = nil
+                    spec.currentDischargeNode.dischargeFillUnitIndex = nil 
+                    spec.currentDischargeNode.dischargeHit = false
+                    
+                    -- NUCLEAR: Clear ALL possible cached references including node IDs
+                    spec.currentDischargeNode.dischargeObjectInfo = nil
+                    spec.currentDischargeNode.dischargeTargetObject = nil
+                    spec.currentDischargeNode.lastDischargeObject = nil
+                    spec.currentDischargeNode.dischargeFailedReason = nil
+                    spec.currentDischargeNode.dischargeFailedReasonShown = nil
+                    spec.currentDischargeNode.dischargeFailedObjectId = nil
+                    spec.currentDischargeNode.lastDischargeObjectId = nil
+                    spec.currentDischargeNode.dischargeHitObject = nil
+                    spec.currentDischargeNode.dischargeHitObjectUnitIndex = nil
+                    spec.currentDischargeNode.dischargeHitObjectId = nil
+                    spec.currentDischargeNode.dischargeHitTerrain = nil
+                    spec.currentDischargeNode.lastDischargeDistanceCheck = nil
+                    
+                    if spec.currentDischargeNode.raycastInfo then
+                        spec.currentDischargeNode.raycastInfo.hitObject = nil
+                        spec.currentDischargeNode.raycastInfo.hitObjectId = nil
+                        spec.currentDischargeNode.raycastInfo.hitTerrain = nil
+                    end
+                    CpUtil.info('DEBUG: Implement %d currentDischargeNode cleared', i)
+                end
+                if spec.dischargeNodes then
+                    CpUtil.info('DEBUG: Implement %d has %d discharge nodes', i, #spec.dischargeNodes)
+                    for j, dischargeNode in pairs(spec.dischargeNodes) do
+                        if dischargeNode.dischargeObject then
+                            CpUtil.info('DEBUG: Implement %d node %d had dischargeObject %s', i, j, 
+                                tostring(dischargeNode.dischargeObject))
+                        end
+                        dischargeNode.dischargeObject = nil
+                        dischargeNode.dischargeFillUnitIndex = nil
+                        dischargeNode.dischargeHit = false
+                        
+                        -- NUCLEAR: Clear ALL possible cached references including node IDs
+                        dischargeNode.dischargeObjectInfo = nil
+                        dischargeNode.dischargeTargetObject = nil
+                        dischargeNode.lastDischargeObject = nil
+                        dischargeNode.dischargeFailedReason = nil
+                        dischargeNode.dischargeFailedReasonShown = nil
+                        dischargeNode.dischargeFailedObjectId = nil
+                        dischargeNode.lastDischargeObjectId = nil
+                        dischargeNode.dischargeHitObject = nil
+                        dischargeNode.dischargeHitObjectUnitIndex = nil
+                        dischargeNode.dischargeHitObjectId = nil
+                        dischargeNode.dischargeHitTerrain = nil
+                        dischargeNode.lastDischargeDistanceCheck = nil
+                        
+                        if dischargeNode.raycastInfo then
+                            dischargeNode.raycastInfo.hitObject = nil
+                            dischargeNode.raycastInfo.hitObjectId = nil
+                            dischargeNode.raycastInfo.hitTerrain = nil
+                        end
+                    end
+                end
+            else
+                CpUtil.info('DEBUG: Implement %d (%s) has no dischargeable spec', i, object and CpUtil.getName(object) or 'nil')
+            end
+        end
+    end
+    
+    CpUtil.info('DEBUG: Discharge state cleanup completed')
+    
+    -- STEP 3: Clear spec-level cached discharge information
+    CpUtil.info('DEBUG: Step 3 - Clearing spec-level discharge cache...')
+    if self.vehicle and self.vehicle.spec_dischargeable then
+        local spec = self.vehicle.spec_dischargeable
+        -- Clear any spec-level cached objects/distances
+        spec.dischargeHitObject = nil
+        spec.dischargeHitObjectUnitIndex = nil
+        spec.lastDischargeObject = nil
+        spec.lastDischargeDistance = nil
+        CpUtil.info('DEBUG: Vehicle spec-level discharge cache cleared')
+    end
+    
+    if self.vehicle then
+        for i, implement in pairs(self.vehicle:getAttachedImplements()) do
+            local object = implement.object
+            if object and object.spec_dischargeable then
+                local spec = object.spec_dischargeable
+                spec.dischargeHitObject = nil
+                spec.dischargeHitObjectUnitIndex = nil
+                spec.lastDischargeObject = nil
+                spec.lastDischargeDistance = nil
+                CpUtil.info('DEBUG: Implement %d spec-level discharge cache cleared', i)
+            end
+        end
+    end
+    
+    -- STEP 4: Disable discharge triggers (additional safety)
+    if self.vehicle and self.vehicle.spec_dischargeable then
+        CpUtil.info('DEBUG: Disabling discharge triggers...')
+        local spec = self.vehicle.spec_dischargeable
+        if spec.dischargeTriggers then
+            for _, trigger in pairs(spec.dischargeTriggers) do
+                trigger.isEnabled = false
+            end
+        end
+    end
+    
+    -- Also for implements
+    if self.vehicle then
+        for i, implement in pairs(self.vehicle:getAttachedImplements()) do
+            local object = implement.object
+            if object and object.spec_dischargeable then
+                local spec = object.spec_dischargeable
+                if spec.dischargeTriggers then
+                    for _, trigger in pairs(spec.dischargeTriggers) do
+                        trigger.isEnabled = false
+                    end
+                end
+            end
+        end
+    end
+    
+    CpUtil.info('===========================================')
+end
+
+--- Continuously monitor and clear any problematic discharge references
+function AIDriveStrategyRefillAtLoader:monitorDischargeReferences()
+    local foundProblem = false
+    
+    -- Ensure discharge state is OFF
+    if self.vehicle and self.vehicle.spec_dischargeable then
+        local spec = self.vehicle.spec_dischargeable
+        if spec.currentDischargeState ~= Dischargeable.DISCHARGE_STATE_OFF then
+            CpUtil.info('DEBUG MONITOR: Discharge state not OFF, forcing OFF...')
+            if self.vehicle.setDischargeState then
+                self.vehicle:setDischargeState(Dischargeable.DISCHARGE_STATE_OFF, true)
+            end
+            foundProblem = true
+        end
+        
+        -- Check spec-level caching
+        if spec.dischargeHitObject or spec.lastDischargeObject then
+            CpUtil.info('DEBUG MONITOR: Found spec-level discharge cache, clearing...')
+            spec.dischargeHitObject = nil
+            spec.dischargeHitObjectUnitIndex = nil
+            spec.lastDischargeObject = nil
+            spec.lastDischargeDistance = nil
+            foundProblem = true
+        end
+        
+        if spec.currentDischargeNode and spec.currentDischargeNode.dischargeObject then
+            CpUtil.info('DEBUG MONITOR: Found lingering vehicle discharge reference, clearing...')
+            spec.currentDischargeNode.dischargeObject = nil
+            spec.currentDischargeNode.dischargeFillUnitIndex = nil
+            spec.currentDischargeNode.dischargeObjectInfo = nil
+            spec.currentDischargeNode.dischargeTargetObject = nil
+            spec.currentDischargeNode.lastDischargeObject = nil
+            spec.currentDischargeNode.dischargeFailedObjectId = nil
+            spec.currentDischargeNode.lastDischargeObjectId = nil
+            spec.currentDischargeNode.dischargeHitObject = nil
+            spec.currentDischargeNode.dischargeHitObjectUnitIndex = nil
+            spec.currentDischargeNode.dischargeHitObjectId = nil
+            spec.currentDischargeNode.dischargeHitTerrain = nil
+            spec.currentDischargeNode.lastDischargeDistanceCheck = nil
+            foundProblem = true
+        end
+        if spec.dischargeNodes then
+            for i, node in pairs(spec.dischargeNodes) do
+                if node.dischargeObject then
+                    CpUtil.info('DEBUG MONITOR: Found lingering vehicle discharge node %d reference, clearing...', i)
+                    node.dischargeObject = nil
+                    node.dischargeFillUnitIndex = nil
+                    node.dischargeObjectInfo = nil
+                    node.dischargeTargetObject = nil
+                    node.lastDischargeObject = nil
+                    node.dischargeFailedObjectId = nil
+                    node.lastDischargeObjectId = nil
+                    node.dischargeHitObject = nil
+                    node.dischargeHitObjectUnitIndex = nil
+                    node.dischargeHitObjectId = nil
+                    node.dischargeHitTerrain = nil
+                    node.lastDischargeDistanceCheck = nil
+                    foundProblem = true
+                end
+            end
+        end
+    end
+    
+    -- Check implements
+    if self.vehicle then
+        for i, implement in pairs(self.vehicle:getAttachedImplements()) do
+            local object = implement.object
+            if object and object.spec_dischargeable then
+                local spec = object.spec_dischargeable
+                
+                -- Ensure implement discharge state is OFF
+                if spec.currentDischargeState ~= Dischargeable.DISCHARGE_STATE_OFF then
+                    CpUtil.info('DEBUG MONITOR: Implement %d discharge state not OFF, forcing OFF...', i)
+                    if object.setDischargeState then
+                        object:setDischargeState(Dischargeable.DISCHARGE_STATE_OFF, true)
+                    end
+                    foundProblem = true
+                end
+                
+                -- Check implement spec-level caching
+                if spec.dischargeHitObject or spec.lastDischargeObject then
+                    CpUtil.info('DEBUG MONITOR: Found implement %d spec-level discharge cache, clearing...', i)
+                    spec.dischargeHitObject = nil
+                    spec.dischargeHitObjectUnitIndex = nil
+                    spec.lastDischargeObject = nil
+                    spec.lastDischargeDistance = nil
+                    foundProblem = true
+                end
+                
+                if spec.currentDischargeNode and spec.currentDischargeNode.dischargeObject then
+                    CpUtil.info('DEBUG MONITOR: Found lingering implement %d discharge reference, clearing...', i)
+                    spec.currentDischargeNode.dischargeObject = nil
+                    spec.currentDischargeNode.dischargeFillUnitIndex = nil
+                    spec.currentDischargeNode.dischargeObjectInfo = nil
+                    spec.currentDischargeNode.dischargeTargetObject = nil
+                    spec.currentDischargeNode.lastDischargeObject = nil
+                    spec.currentDischargeNode.dischargeFailedObjectId = nil
+                    spec.currentDischargeNode.lastDischargeObjectId = nil
+                    spec.currentDischargeNode.dischargeHitObject = nil
+                    spec.currentDischargeNode.dischargeHitObjectUnitIndex = nil
+                    spec.currentDischargeNode.dischargeHitObjectId = nil
+                    spec.currentDischargeNode.dischargeHitTerrain = nil
+                    spec.currentDischargeNode.lastDischargeDistanceCheck = nil
+                    foundProblem = true
+                end
+                if spec.dischargeNodes then
+                    for j, node in pairs(spec.dischargeNodes) do
+                        if node.dischargeObject then
+                            CpUtil.info('DEBUG MONITOR: Found lingering implement %d node %d reference, clearing...', i, j)
+                            node.dischargeObject = nil
+                            node.dischargeFillUnitIndex = nil
+                            node.dischargeObjectInfo = nil
+                            node.dischargeTargetObject = nil
+                            node.lastDischargeObject = nil
+                            node.dischargeFailedObjectId = nil
+                            node.lastDischargeObjectId = nil
+                            node.dischargeHitObject = nil
+                            node.dischargeHitObjectUnitIndex = nil
+                            node.dischargeHitObjectId = nil
+                            node.dischargeHitTerrain = nil
+                            node.lastDischargeDistanceCheck = nil
+                            foundProblem = true
+                        end
+                    end
+                end
+            end
+        end
+    end
+    
+    if foundProblem then
+        CpUtil.info('DEBUG MONITOR: Cleared lingering discharge references')
+    end
+end
+
 function AIDriveStrategyRefillAtLoader:finishRefilling()
-    self:debug('Finishing refill')
+    CpUtil.info('DEBUG: finishRefilling() called')
+    
+    self:cleanupDischargeState()
+    
     -- Disable refilling mode for all relevant controllers
     if self.controllers then
+        local numControllers = 0
+        for _ in pairs(self.controllers) do
+            numControllers = numControllers + 1
+        end
+        CpUtil.info('DEBUG: Stopping %d controllers...', numControllers)
         for _, controller in pairs(self.controllers) do
             if controller.onStopRefilling then
                 controller:onStopRefilling()
             end
         end
+    else
+        CpUtil.info('DEBUG: No controllers to stop')
     end
+    
+    -- Don't destroy refillTargetNode - it's a reference to the loader's discharge node, not ours!
+    -- Just clear the reference
+    if self.refillTargetNode then
+        CpUtil.info('DEBUG: Clearing refill target node reference')
+        self.refillTargetNode = nil
+    end
+    
+    self.loaderVehicle = nil
+    self.dischargeNode = nil
+    CpUtil.info('DEBUG: finishRefilling() completed')
 end
 
 function AIDriveStrategyRefillAtLoader:isRefillingComplete()
