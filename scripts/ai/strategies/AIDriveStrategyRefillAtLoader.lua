@@ -798,37 +798,63 @@ function AIDriveStrategyRefillAtLoader:isRefillingComplete()
 
     local function evaluateObject(object)
         if not object or not object.getFillUnits then
-            return
+            return false, true
         end
         local fillUnits = object:getFillUnits()
         if not fillUnits then
-            return
+            return false, true
         end
+
+        local objectHasRelevantUnit = false
+        local objectAllUnitsFilled = true
 
         for fillUnitIndex, _ in pairs(fillUnits) do
             local capacity = object:getFillUnitCapacity(fillUnitIndex)
             if capacity and capacity > 0 and unitSupportsRequiredFillType(object, fillUnitIndex) then
-                fallbackHasRelevantUnit = true
+                objectHasRelevantUnit = true
                 local fillLevel = object:getFillUnitFillLevel(fillUnitIndex)
                 local fillLevelPercent = fillLevel / capacity
                 if fillLevelPercent < 0.95 then
-                    fallbackAllRelevantUnitsFilled = false
+                    objectAllUnitsFilled = false
                     self:debugSparse('Fallback refill unit %s:%d at %.1f percent (%.0f/%.0f)',
                         CpUtil.getName(object), fillUnitIndex, fillLevelPercent * 100, fillLevel, capacity)
                 end
             end
         end
+
+        return objectHasRelevantUnit, objectAllUnitsFilled
     end
 
-    evaluateObject(self.vehicle)
-    for _, implement in pairs(self.vehicle:getAttachedAIImplements()) do
-        if implement and implement.object then
-            evaluateObject(implement.object)
+    local visited = {}
+    local function traverseObject(object)
+        if not object or visited[object] then
+            return
+        end
+        visited[object] = true
+
+        local hasUnit, allFilled = evaluateObject(object)
+        if hasUnit then
+            fallbackHasRelevantUnit = true
+            fallbackAllRelevantUnitsFilled = fallbackAllRelevantUnitsFilled and allFilled
+        end
+
+        if object.getAttachedImplements then
+            for _, impl in pairs(object:getAttachedImplements()) do
+                traverseObject(impl and (impl.object or impl))
+            end
+        end
+
+        if object.getAttachedAIImplements then
+            for _, impl in pairs(object:getAttachedAIImplements()) do
+                traverseObject(impl and (impl.object or impl))
+            end
         end
     end
 
+    traverseObject(self.vehicle)
+
     if fallbackHasRelevantUnit and fallbackAllRelevantUnitsFilled then
-        self:debug('REFILL STRATEGY: Fallback completion detection confirmed all relevant units >= 95%%')
+        self:debug('REFILL STRATEGY: Recursive completion detection confirmed all relevant units >= 95%%')
     end
 
     return fallbackHasRelevantUnit and fallbackAllRelevantUnitsFilled
