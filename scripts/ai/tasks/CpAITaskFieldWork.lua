@@ -125,6 +125,15 @@ function CpAITaskFieldWork:setDrivingToLoaderActive()
 			CpUtil.info('REFILL: !!!!! WARNING - No field polygon to pass !!!!!')
 		end
 		
+		-- Pass the saved course and waypoint for return after refilling
+		CpUtil.info('REFILL: Passing saved course and waypoint to strategy...')
+		if self.savedCourse and self.savedWaypointIx then
+			self.refillStrategy:setSavedCourse(self.savedCourse, self.savedWaypointIx)
+			CpUtil.info('REFILL: ✓ Saved course passed successfully')
+		else
+			CpUtil.info('REFILL: !!!!! WARNING - No saved course to pass !!!!!')
+		end
+		
 		CpUtil.info('REFILL: Calling setAIVehicle...')
 		self.refillStrategy:setAIVehicle(self.vehicle, self.job:getCpJobParameters())
 		CpUtil.info('REFILL: setAIVehicle done')

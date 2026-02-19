@@ -39,6 +39,7 @@ AIDriveStrategyRefillAtLoader.myStates = {
     WAITING_FOR_PATHFINDER = {},
     DRIVING_TO_LOADER = {},
     WAITING_FOR_REFILL = {},
+    DRIVING_BACK_TO_COURSE = {},
     REFILL_COMPLETE = {},
 }
 
@@ -62,6 +63,10 @@ function AIDriveStrategyRefillAtLoader:init(task, job)
     self.lastSearchedFillType = nil
     self.refillSucceeded = false
     self.startCalled = false
+    
+    -- Saved course for return
+    self.savedCourse = nil
+    self.savedWaypointIx = nil
     
     -- Cleanup tracking
     self.dischargeCleaned = false
@@ -133,6 +138,15 @@ function AIDriveStrategyRefillAtLoader:setFieldPolygon(fieldPolygon, islandPolyg
     self.fieldPolygon = fieldPolygon
     self.islandPolygons = islandPolygons
     self:debug('Field polygon set with %d vertices', fieldPolygon and #fieldPolygon or 0)
+end
+
+--- Set the saved course to return to after refilling
+---@param course Course the course to return to
+---@param waypointIx number waypoint index to continue from
+function AIDriveStrategyRefillAtLoader:setSavedCourse(course, waypointIx)
+    self.savedCourse = course
+    self.savedWaypointIx = waypointIx
+    self:debug('Saved course set with waypoint %d', waypointIx)
 end
 
 function AIDriveStrategyRefillAtLoader:start()
@@ -408,6 +422,108 @@ function AIDriveStrategyRefillAtLoader:onPathfindingObstacleAtStart(controller, 
     else
         self:debug('Pathfinding detected obstacle at start, cannot proceed')
         self.vehicle:stopCurrentAIJob(AIMessageCpErrorNoPathFound.new())
+    end
+end
+
+--- Start pathfinding to return to the fieldwork course
+function AIDriveStrategyRefillAtLoader:startReturnToCourse()
+    if not self.savedCourse or not self.savedWaypointIx then
+        self:debug('ERROR: No saved course/waypoint for return, completing refill without return path')
+        self.state = self.states.REFILL_COMPLETE
+        return
+    end
+    
+    self:debug('Starting pathfinding to return to course at waypoint %d', self.savedWaypointIx)
+    self.pathfindingStartedAt = g_currentMission.time
+    self.state = self.states.WAITING_FOR_PATHFINDER
+    
+    local context = PathfinderContext(self.vehicle):allowReverse(self:getAllowReversePathfinding())
+    context:ignoreFruit(not self.settings.avoidFruit:getValue())
+    context:offFieldPenalty(PathfinderContext.defaultOffFieldPenalty)
+    
+    self.pathfinderController:registerListeners(self,
+            self.onPathfindingDoneToReturnToCourse,
+            self.onPathfindingFailedToReturnToCourse,
+            self.onPathfindingObstacleAtStartForReturn)
+    
+    -- Find path back to the saved waypoint
+    self.pathfinderController:findPathToWaypoint(context, self.savedCourse, 
+            self.savedWaypointIx, 0, 0, 1)
+end
+
+--- Callback when pathfinding back to course is successful
+function AIDriveStrategyRefillAtLoader:onPathfindingDoneToReturnToCourse(controller, success, course, goalNodeInvalid)
+    if success then
+        self:debug('Pathfinding back to course successful, %d waypoints (%d ms)', 
+                course and #course or 0, 
+                g_currentMission.time - (self.pathfindingStartedAt or 0))
+        
+        -- Adjust course for towed implements
+        course:adjustForTowedImplements(2)
+        
+        -- Create alignment segment: straight line from end of pathfinder course 
+        -- in the direction of the target waypoint to ensure proper alignment
+        local lastX, _, lastZ = course:getWaypointPosition(course:getNumberOfWaypoints())
+        local targetX, _, targetZ = self.savedCourse:getWaypointPosition(self.savedWaypointIx)
+        local targetAngle = self.savedCourse:getWaypointAngleDeg(self.savedWaypointIx)
+        
+        -- Calculate a point beyond the target waypoint for alignment
+        local fm = self:getFrontAndBackMarkers()
+        local alignmentDistance = fm + 4
+        local targetYRot = math.rad(targetAngle)
+        local alignEndX = targetX + math.sin(targetYRot) * alignmentDistance
+        local alignEndZ = targetZ + math.cos(targetYRot) * alignmentDistance
+        
+        -- Create straight alignment course from pathfinder end to beyond target waypoint
+        local alignmentCourse = Course.createFromTwoWorldPositions(self.vehicle,
+                lastX, lastZ, alignEndX, alignEndZ, 0, 0, 0, 3, false)
+        course:append(alignmentCourse)
+        
+        self:debug('Added alignment course: %.1fm to straighten up', alignmentDistance)
+        
+        self.state = self.states.DRIVING_BACK_TO_COURSE
+        self.ppc:setNormalLookaheadDistance()
+        self:startCourse(course, 1)
+        return true
+    else
+        self:debug('Pathfinding back to course failed, completing without return path')
+        self.state = self.states.REFILL_COMPLETE
+        return false
+    end
+end
+
+--- Callback when pathfinding back to course fails
+function AIDriveStrategyRefillAtLoader:onPathfindingFailedToReturnToCourse(controller, lastContext, wasLastRetry,
+                                                                           currentRetryAttempt, trailerCollisionsOnly,
+                                                                           fruitPenaltyNodePercent, offFieldPenaltyNodePercent)
+    local offFieldPenaltyRelaxingSteps = { 0.5, 0.25, 0.1}
+    
+    if not wasLastRetry then
+        -- Relax off-field penalty and retry
+        if offFieldPenaltyRelaxingSteps[currentRetryAttempt] then
+            self:debug('Return pathfinding failed, relaxing off-field penalty to %.2f and retrying',
+                    offFieldPenaltyRelaxingSteps[currentRetryAttempt])
+            lastContext:offFieldPenalty(offFieldPenaltyRelaxingSteps[currentRetryAttempt] * PathfinderContext.defaultOffFieldPenalty)
+        end
+        controller:retry(lastContext)
+    else
+        -- All retries exhausted - give up and complete without return path
+        self:debug('Return pathfinding failed after all retries, completing without return path')
+        self.state = self.states.REFILL_COMPLETE
+    end
+end
+
+--- Callback when obstacle is detected at start for return path
+function AIDriveStrategyRefillAtLoader:onPathfindingObstacleAtStartForReturn(controller, lastContext, maxDistance,
+                                                                              trailerCollisionsOnly, fruitPenaltyNodePercent,
+                                                                              offFieldPenaltyNodePercent)
+    if trailerCollisionsOnly then
+        self:debug('Return pathfinding detected obstacle at start (trailer collisions only), ignoring')
+        lastContext:ignoreTrailerAtStartRange(1.5 * self.turningRadius)
+        controller:retry(lastContext)
+    else
+        self:debug('Return pathfinding detected obstacle at start, completing without return path')
+        self.state = self.states.REFILL_COMPLETE
     end
 end
 
@@ -715,6 +831,33 @@ function AIDriveStrategyRefillAtLoader:getDriveData(dt, vX, vY, vZ)
             self.implementsRaised = true
         end
         
+    elseif self.state == self.states.DRIVING_BACK_TO_COURSE then
+        -- Driving back to the fieldwork course with pathfinder-generated path
+        if not moveForwards then
+            local maxSpeed
+            gx, gz, maxSpeed = self:getReverseDriveData()
+            self:setMaxSpeed(maxSpeed)
+        else
+            gx, _, gz = self.ppc:getGoalPointPosition()
+            self:setMaxSpeed(self.settings.fieldSpeed:getValue())
+        end
+        
+        -- Keep implements raised while returning to course
+        if not self.implementsRaised then
+            self:raiseImplements()
+            self.implementsRaised = true
+        end
+        
+        -- Check if we've reached the end of the return course
+        if self.ppc:getCourse():isCloseToLastWaypoint(3) then
+            CpUtil.info('=========================================')
+            CpUtil.info('REFILL STRATEGY: ✓✓✓ RETURNED TO COURSE!')
+            CpUtil.info('REFILL STRATEGY: Now at saved waypoint %d', self.savedWaypointIx)
+            CpUtil.info('REFILL STRATEGY: Completing refill process...')
+            CpUtil.info('=========================================')
+            self.state = self.states.REFILL_COMPLETE
+        end
+        
     elseif self.state == self.states.REFILL_COMPLETE then
         self:setMaxSpeed(0)
         gx, gz = 0, 0
@@ -758,10 +901,8 @@ function AIDriveStrategyRefillAtLoader:updateRefilling(dt)
         CpUtil.info('===========================================')
         CpUtil.info('REFILL STRATEGY: ✓✓✓ REFILLING COMPLETE!')
         CpUtil.info('REFILL STRATEGY: Tank is now at 95%% or higher')
-        CpUtil.info('REFILL STRATEGY: Returning to fieldwork...')
         CpUtil.info('DEBUG: About to call finishRefilling...')
         self.refillSucceeded = true  -- Ensure flag is set
-        self.state = self.states.REFILL_COMPLETE
         self:finishRefilling()
         -- Immediate cleanup to prevent entity errors
         if not self.dischargeCleaned then
@@ -770,6 +911,10 @@ function AIDriveStrategyRefillAtLoader:updateRefilling(dt)
         else
             CpUtil.info('DEBUG: Discharge already cleaned')
         end
+        
+        -- Start pathfinding back to course instead of completing immediately
+        CpUtil.info('REFILL STRATEGY: Starting pathfinding back to course...')
+        self:startReturnToCourse()
         CpUtil.info('===========================================')
         return
     end

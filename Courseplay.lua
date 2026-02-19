@@ -14,7 +14,6 @@ g_modManager.CP_MOD_NAME = g_currentModName
 function Courseplay:init()
 	---TODO_25
 	-- g_gui:loadProfiles( Utils.getFilename("config/gui/GUIProfiles.xml", Courseplay.BASE_DIRECTORY) )
-
 	--- Base cp folder
 	self.baseDir = getUserProfileAppPath() .. "modSettings/" .. Courseplay.MOD_NAME ..  "/"
 	createFolder(self.baseDir)
