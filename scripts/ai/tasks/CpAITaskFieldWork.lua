@@ -262,6 +262,8 @@ function CpAITaskFieldWork:update(dt)
 			
 			if refillSucceeded then
 				self:debug('REFILL: Refill completed successfully, returning to fieldwork')
+				-- Clear the "needs filling" error message
+				self.vehicle:resetCpAllActiveInfoTexts()
 				-- Restart fieldwork strategy with saved course
 				if self.savedCourse then
 					self:debug('REFILL: Restoring fieldwork course at waypoint %d', self.savedWaypointIx)
