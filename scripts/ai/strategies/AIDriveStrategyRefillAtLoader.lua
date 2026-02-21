@@ -188,10 +188,15 @@ function AIDriveStrategyRefillAtLoader:start()
     end
     
     if not self.loaderVehicle then
-        self:debug('No loader found yet, entering waiting state')
+        CpUtil.info('=========================================')
+        CpUtil.info('REFILL STRATEGY: No loader found yet')
+        CpUtil.info('REFILL STRATEGY: Waiting at current position for loader to become available')
+        CpUtil.info('REFILL STRATEGY: Will search again every %.1f seconds', self.loaderSearchInterval / 1000)
+        CpUtil.info('=========================================')
         self.state = self.states.WAITING_FOR_LOADER
         self.loaderSearchTimer = 0
         self.lastSearchedFillType = fillTypeIndex
+        self:setInfoText(InfoTextManager.WAITING_FOR_UNLOADER)  -- Show waiting message to user
         return
     end
     
@@ -310,29 +315,61 @@ end
 
 --- Start pathfinding to the loader (similar to unloader approach)
 function AIDriveStrategyRefillAtLoader:startPathfindingToLoader()
+    CpUtil.info('=========================================')
+    CpUtil.info('PATHFINDING START: Beginning pathfinding to loader...')
+    
     if self.pathfinder and self.pathfinder:isActive() then
-        self:debug('Pathfinder already active')
+        CpUtil.info('PATHFINDING START: WARNING - Pathfinder already active, skipping')
+        CpUtil.info('=========================================')
         return
     end
+    
+    -- Validate that we still have a loader
+    if not self.loaderVehicle then
+        CpUtil.info('PATHFINDING START: ERROR - No loader vehicle set')
+        CpUtil.info('PATHFINDING START: Aborting pathfinding')
+        CpUtil.info('=========================================')
+        self.state = self.states.REFILL_COMPLETE
+        return
+    end
+    
+    if not self.dischargeNode then
+        CpUtil.info('PATHFINDING START: ERROR - No discharge node set')
+        CpUtil.info('PATHFINDING START: Aborting pathfinding')
+        CpUtil.info('=========================================')
+        self.state = self.states.REFILL_COMPLETE
+        return
+    end
+    
+    CpUtil.info('PATHFINDING START: Loader: %s', CpUtil.getName(self.loaderVehicle))
+    CpUtil.info('PATHFINDING START: Discharge node: %s', tostring(self.dischargeNode.node))
     
     -- Get target parameters
     local targetNode, alignLength, offsetX, loaderVehicle = self:getRefillTargetParameters()
     if not targetNode then
-        self:debug('Could not get refill target parameters')
+        CpUtil.info('PATHFINDING START: ERROR - Could not get refill target parameters')
+        CpUtil.info('PATHFINDING START: This usually means the loader or discharge node became invalid')
+        CpUtil.info('PATHFINDING START: Aborting pathfinding')
+        CpUtil.info('=========================================')
         self.state = self.states.REFILL_COMPLETE
         return
     end
+    
+    CpUtil.info('PATHFINDING START: [OK] Target parameters obtained')
+    CpUtil.info('PATHFINDING START: Target node: %s', tostring(targetNode))
+    CpUtil.info('PATHFINDING START: Align length: %.1f m', alignLength)
+    CpUtil.info('PATHFINDING START: Offset X: %.1f m (%s side)', offsetX, offsetX < 0 and 'LEFT' or 'RIGHT')
     
     self.refillTargetNode = targetNode
     self.loaderVehicle = loaderVehicle
     
     -- Create alignment course (straight section parallel to loader)
-    self:debug('Creating align course relative to target node from %.1f to %.1f',
-            -alignLength + 1, -self.refillTargetOffset)
+    CpUtil.info('PATHFINDING START: Creating alignment course...')
     self.refillAlignCourse = Course.createFromNode(self.vehicle, self.refillTargetNode,
             offsetX, -alignLength + 1,
             -self.refillTargetOffset,
             1, false)
+    CpUtil.info('PATHFINDING START: [OK] Alignment course created')
     
     self.state = self.states.WAITING_FOR_PATHFINDER
     
@@ -348,20 +385,39 @@ function AIDriveStrategyRefillAtLoader:startPathfindingToLoader()
     
     -- Ignore off-field penalty around the loader to allow bridging gap between field and loader
     if self.loaderVehicle then
+        CpUtil.info('PATHFINDING START: Creating off-field penalty ignore area around loader')
         context:areaToIgnoreOffFieldPenalty(
                 PathfinderUtil.NodeArea.createVehicleArea(self.loaderVehicle, 1.5 * SelfRefillHelper.maxDistanceFromField))
+        CpUtil.info('PATHFINDING START: [OK] Penalty ignore area added')
+    else
+        CpUtil.info('PATHFINDING START: WARNING - No loader vehicle for penalty ignore area')
     end
     
-    context:maxIterations(PathfinderUtil.getMaxIterationsForFieldPolygon(self.vehicle:cpGetFieldPolygon()))
+    local maxIterations = PathfinderUtil.getMaxIterationsForFieldPolygon(self.vehicle:cpGetFieldPolygon())
+    context:maxIterations(maxIterations)
+    CpUtil.info('PATHFINDING START: Max iterations: %d', maxIterations)
     
+    CpUtil.info('PATHFINDING START: Registering pathfinder callbacks...')
     self.pathfinderController:registerListeners(self,
             self.onPathfindingDoneToLoader,
             self.onPathfindingFailedToLoader,
             self.onPathfindingObstacleAtStart)
     
-    self.pathfinderController:findPathToNode(context, self.refillTargetNode, offsetX, -alignLength, 3)
+    CpUtil.info('PATHFINDING START: Starting pathfinder...')
+    CpUtil.info('PATHFINDING START: Parameters:')
+    CpUtil.info('PATHFINDING START:   - Target node: %s', tostring(self.refillTargetNode))
+    CpUtil.info('PATHFINDING START:   - Offset X: %.1f', offsetX)
+    CpUtil.info('PATHFINDING START:   - Z Start: %.1f', -alignLength)
+    CpUtil.info('PATHFINDING START:   - Z End: %.1f', 3)
     
-    self:debug('Pathfinding started to loader')
+    local success = self.pathfinderController:findPathToNode(context, self.refillTargetNode, offsetX, -alignLength, 3)
+    
+    if success then
+        CpUtil.info('PATHFINDING START: [OK] Pathfinder started successfully')
+    else
+        CpUtil.info('PATHFINDING START: ERROR - Pathfinder failed to start')
+    end
+    CpUtil.info('=========================================')
 end
 
 --- Get target parameters for refill (delegated to SelfRefillHelper)
@@ -396,17 +452,29 @@ function AIDriveStrategyRefillAtLoader:onPathfindingFailedToLoader(controller, l
                                                                     fruitPenaltyNodePercent, offFieldPenaltyNodePercent)
     local offFieldPenaltyRelaxingSteps = { 0.5, 0.25, 0.1}
     
+    CpUtil.info('=========================================')  
+    CpUtil.info('PATHFINDING FAILED: Attempt %d', currentRetryAttempt)
+    CpUtil.info('PATHFINDING FAILED: Trailer collisions only: %s', tostring(trailerCollisionsOnly))
+    CpUtil.info('PATHFINDING FAILED: Fruit penalty: %.2f%%', fruitPenaltyNodePercent or 0)
+    CpUtil.info('PATHFINDING FAILED: Off-field penalty: %.2f%%', offFieldPenaltyNodePercent or 0)
+    
     if not wasLastRetry then
         -- Relax off-field penalty and retry
         if offFieldPenaltyRelaxingSteps[currentRetryAttempt] then
-            self:debug('Pathfinding failed, relaxing off-field penalty to %.2f and retrying',
+            CpUtil.info('PATHFINDING FAILED: Relaxing off-field penalty to %.2f and retrying',
                     offFieldPenaltyRelaxingSteps[currentRetryAttempt])
             lastContext:offFieldPenalty(offFieldPenaltyRelaxingSteps[currentRetryAttempt] * PathfinderContext.defaultOffFieldPenalty)
         end
+        CpUtil.info('=========================================')  
         controller:retry(lastContext)
     else
         -- All retries exhausted
-        self:debug('Pathfinding failed after all retries')
+        CpUtil.info('PATHFINDING FAILED: All retries exhausted - NO PATH FOUND')
+        CpUtil.info('PATHFINDING FAILED: Possible causes:')
+        CpUtil.info('  - Chosen side is blocked (fence, building, etc.)')
+        CpUtil.info('  - Vehicle position is bad for pathfinding')
+        CpUtil.info('  - Loader is in inaccessible location')
+        CpUtil.info('=========================================')  
         self.vehicle:stopCurrentAIJob(AIMessageCpErrorNoPathFound.new())
     end
 end
@@ -415,12 +483,20 @@ end
 function AIDriveStrategyRefillAtLoader:onPathfindingObstacleAtStart(controller, lastContext, maxDistance,
                                                                      trailerCollisionsOnly, fruitPenaltyNodePercent,
                                                                      offFieldPenaltyNodePercent)
+    CpUtil.info('=========================================')  
+    CpUtil.info('PATHFINDING: Obstacle detected at start position')
+    CpUtil.info('PATHFINDING: Max distance: %.1f m', maxDistance or 0)
+    CpUtil.info('PATHFINDING: Trailer collisions only: %s', tostring(trailerCollisionsOnly))
+    
     if trailerCollisionsOnly then
-        self:debug('Pathfinding detected obstacle at start (trailer collisions only), ignoring')
+        CpUtil.info('PATHFINDING: Ignoring trailer collisions and retrying')
+        CpUtil.info('=========================================')  
         lastContext:ignoreTrailerAtStartRange(1.5 * self.turningRadius)
         controller:retry(lastContext)
     else
-        self:debug('Pathfinding detected obstacle at start, cannot proceed')
+        CpUtil.info('PATHFINDING: Real obstacle at start - cannot proceed')
+        CpUtil.info('PATHFINDING: Vehicle might be blocked or in bad position')
+        CpUtil.info('=========================================')  
         self.vehicle:stopCurrentAIJob(AIMessageCpErrorNoPathFound.new())
     end
 end
@@ -538,6 +614,33 @@ function AIDriveStrategyRefillAtLoader:update(dt)
         end
         self:debug('!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!')
         self:start()
+    elseif self.startCalled and self.state == self.states.SEARCHING_FOR_LOADER then
+        -- Strategy is being reused for a second refill - reset important flags
+        if self.refillSucceeded or self.refillTimer > 0 then
+            self:debug('=========================================')
+            self:debug('REFILL STRATEGY: Resetting for repeated refill')
+            self:debug('Previous state: refillSucceeded=%s, refillTimer=%.1fs', 
+                tostring(self.refillSucceeded), self.refillTimer / 1000)
+            
+            -- Reset refill tracking
+            self.refillSucceeded = false
+            self.refillTimer = 0
+            self.refillApproachRetryCount = 0
+            
+            -- Reset loader search
+            self.loaderSearchTimer = 0
+            
+            -- Reset start flag so start() can be called again
+            self.startCalled = false
+            
+            -- Clear previous loader references
+            self.loaderVehicle = nil
+            self.dischargeNode = nil
+            self.refillTargetNode = nil
+            
+            self:debug('REFILL STRATEGY: All flags reset, ready for new refill cycle')
+            self:debug('=========================================')
+        end
     end
     
     -- Handle waiting for loader to appear
@@ -599,8 +702,8 @@ function AIDriveStrategyRefillAtLoader:updateWaitingForLoader(dt)
         local fillTypeIndex = self.lastSearchedFillType
         
         if not fieldPolygon or not fillTypeIndex then
-            CpUtil.info('REFILL STRATEGY: ERROR - Missing field polygon or fill type')
-            self.state = self.states.REFILL_COMPLETE
+            CpUtil.info('REFILL STRATEGY: WARNING - Missing field polygon or fill type, will retry')
+            -- Don't abort, just wait and try again next cycle
             return
         end
         
@@ -610,7 +713,8 @@ function AIDriveStrategyRefillAtLoader:updateWaitingForLoader(dt)
         self.loaderVehicle, self.dischargeNode = SelfRefillHelper:findBestLoader(fieldPolygon, self.vehicle, fillTypeIndex)
         
         if self.loaderVehicle then
-            -- Found a loader! Continue with normal flow
+            -- Found a loader! Clear waiting message and continue with normal flow
+            self:clearInfoText(InfoTextManager.WAITING_FOR_UNLOADER)
             local x, y, z = getWorldTranslation(self.loaderVehicle.rootNode)
             CpUtil.info('REFILL STRATEGY: ✓✓✓ SUCCESS - Loader found!')
             CpUtil.info('REFILL STRATEGY: Loader: %s', CpUtil.getName(self.loaderVehicle))
@@ -632,15 +736,20 @@ function AIDriveStrategyRefillAtLoader:updateWaitingForLoader(dt)
                 return
             end
             -- Vehicle is far away, need to calculate path
-            CpUtil.info('REFILL STRATEGY: Vehicle is %.1fm away, starting pathfinding...', distanceToLoader)
-            CpUtil.info('REFILL STRATEGY: >>> Starting pathfinding to loader <<<')
+            CpUtil.info('REFILL STRATEGY: Vehicle is %.1fm away', distanceToLoader)
+            CpUtil.info('REFILL STRATEGY: >>> Starting folding process before pathfinding <<<')
             
-            -- Start pathfinding
-            self:startPathfindingToLoader()
+            -- Start folding implements first, then pathfinding will follow automatically
+            self:startFoldingForPathfinding()
             CpUtil.info('=========================================')
         else
-            -- Still no loader found
-            CpUtil.info('REFILL STRATEGY: Still no loader found, waiting...')
+            -- Still no loader found - continue waiting
+            if g_updateLoopIndex % 300 == 0 then  -- Log every ~10 seconds
+                local fillTypeName = g_fillTypeManager:getFillTypeNameByIndex(fillTypeIndex)
+                CpUtil.info('REFILL STRATEGY: Still waiting for loader (%s)...', fillTypeName)
+            end
+            CpUtil.info('REFILL STRATEGY: Still no loader found, will check again in %.1f seconds', 
+                self.loaderSearchInterval / 1000)
             CpUtil.info('=========================================')
         end
     end

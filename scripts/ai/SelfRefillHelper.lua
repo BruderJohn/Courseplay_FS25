@@ -22,7 +22,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 SelfRefillHelper = {}
 SelfRefillHelper.debugChannel = CpDebug.DBG_FIELDWORK
 -- search for loaders/fillers within this distance from the field
-SelfRefillHelper.maxDistanceFromField = 30
+SelfRefillHelper.maxDistanceFromField = 10
 
 --- Find a loader/filler vehicle we can use for refilling (slurry tanker, liquid fertilizer trailer, etc.)
 ---@param fieldPolygon Polygon the field boundary. We'll look for loaders on this field, or close to the boundary.
@@ -188,4 +188,3 @@ function SelfRefillHelper:getLoaderTargetParameters(fieldPolygon, myVehicle, fil
     
     return targetNode, alignLength, offsetX, bestLoader
 end
-
