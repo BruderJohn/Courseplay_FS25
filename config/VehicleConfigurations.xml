@@ -11,14 +11,14 @@ with the course.
 
 This file is the global configuration coming with your copy of Courseplay. If you
 want your own vehicle config, you can create a file called
-vehicleConfigurations.xml in your modSettings/FS22_Courseplay folder. Settings defined
+vehicleConfigurations.xml in your modSettings/FS25_Courseplay folder. Settings defined
 in that file will override the settings defined here.
 
-You can use the cpReadVehicleConfigurations console command to reload these files
+You can use the cpVehicleConfigurationsReload console command to reload these files
 in-game.
 
 Custom settings are listed per vehicle, the vehicle is identified by its XML file
-name (you can find this in the game's folder under data/vehicles/<make>/<model>/
+name (you can find this in the game's folder under data/vehicles/<make>/<model>/).
 
 A vehicle may have multiple implements attached. If multiple implements have the
 same attribute defined here, Courseplay just uses the first value it finds, which
@@ -208,7 +208,12 @@ You can define the following custom settings:
 
     <!-- Harvesters -->
     <Vehicle name="hj6130"
-    disablePipeMovingToolCorrection = "true"
+            disablePipeMovingToolCorrection = "true"
+    />
+
+    <Vehicle name = "bigM450.xml"
+            lowerEarly = "true"
+            raiseLate = "true"
     />
 
     <!--vehicles\newHolland-->
@@ -344,6 +349,7 @@ You can define the following custom settings:
     <!--\vehicles\kuhn-->
     <Vehicle name="sw4014.xml"
              toolOffsetX = "-2.5"
+             baleCollectorOffset = "2.2"
              noReverse = "true"
     />
     <Vehicle name="kuhnDeltis1302.xml"
@@ -494,6 +500,9 @@ You can define the following custom settings:
     <!--Harvester-->
 
     <!--Implements-->
+    <Vehicle name="proceedV.xml"
+             implementWheelAlwaysOnGround = "true"
+    />
 
     <!--Premium-->
     <Vehicle name="p3CLProfi.xml"

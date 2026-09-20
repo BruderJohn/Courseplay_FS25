@@ -337,11 +337,7 @@ end
 --- Is the placeable object the same as the silo?  
 function CpBunkerSilo:isTheSameSilo(object)
 	if object and object:isa(Placeable) then 
-		if object.spec_bunkerSilo then 
-			if self.silo == object.spec_bunkerSilo.bunkerSilo then 
-				return true
-			end
-		end
+		return true
 	end
 	return false
 end
