@@ -75,8 +75,13 @@ function CpAIJobFieldWork:isFinishingAllowed(message)
                     end
                 end
                 
-                -- Try to start automatic drive to loader
-                self.fieldWorkTask:setDrivingToLoaderActive()
+                -- Try to start automatic drive to loader. If it can't be started at all (e.g. no
+                -- active drive strategy to switch away from), stop the job instead of silently
+                -- leaving the vehicle stuck with the job neither continuing nor finishing.
+                if not self.fieldWorkTask:setDrivingToLoaderActive() then
+                    CpUtil.info('Refill could not be started, stopping job')
+                    return true
+                end
             end
         end
         return false

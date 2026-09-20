@@ -36,10 +36,9 @@ function SprayerController:needsRefilling()
     end
     
     ImplementUtil.hasFillLevelChanged(self.refillData.lastFillLevels)
-    
-    for implement, data in pairs(self.refillData.lastFillLevels) do 
+
+    for implement, data in pairs(self.refillData.lastFillLevels) do
         for fillUnitIndex, fillLevel in pairs(data) do
-            local capacity = implement:getFillUnitCapacity(fillUnitIndex)
             if fillLevel <= 0 then
                 self:debug('SPRAYER: Fill level is 0 -> needs refilling')
                 return true
@@ -53,10 +52,9 @@ function SprayerController:update()
     -- Update is called by the drive strategy for all controllers
 end
 
--- Track which vehicles have already been stopped to avoid repeated stop calls
-local stoppedVehicles = {}
--- Track when refill was last attempted to prevent endless retries
-local refillAttemptTimestamps = {}
+-- Track which vehicles have already been stopped to avoid repeated stop calls.
+-- Weak keys so a sold/removed vehicle can be garbage collected instead of leaking here forever.
+local stoppedVehicles = setmetatable({}, { __mode = "k" })
 
 local function processSprayerArea(sprayer, superFunc, ...)
     local rootVehicle = sprayer.rootVehicle
@@ -94,8 +92,6 @@ local function processSprayerArea(sprayer, superFunc, ...)
                             'SPRAYER: ✓ Tank no longer empty, ready for next cycle')
                     end
                     stoppedVehicles[rootVehicle] = nil
-                    -- Also reset refill attempt timestamp to allow new attempts
-                    refillAttemptTimestamps[rootVehicle] = nil
                 end
             end
         end

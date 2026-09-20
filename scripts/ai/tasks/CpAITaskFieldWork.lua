@@ -28,31 +28,32 @@ function CpAITaskFieldWork:setWaitingForRefillingActive()
 	end
 end
 
+--- Starts driving to a loader to refill. The cooldown after a failed attempt is checked by the
+--- caller (CpAIJobFieldWork:isFinishingAllowed()) before this is called, so we don't re-check it here.
+---@return boolean true if refilling was (already) started or is waiting for the field boundary,
+--- false if it could not be started at all (e.g. no active drive strategy to switch away from)
 function CpAITaskFieldWork:setDrivingToLoaderActive()
 	local cpSpec = self.vehicle.spec_cpAIFieldWorker
-	
-	-- Check if we're in cooldown after a previous failure
-	if self.refillFailedTimestamp then
-		local timeSinceFailure = g_currentMission.time - self.refillFailedTimestamp
-		if timeSinceFailure < self.refillCooldownMs then
-			local remainingSeconds = math.ceil((self.refillCooldownMs - timeSinceFailure) / 1000)
-			if g_updateLoopIndex % 100 == 0 then  -- Log every ~3 seconds
-				self:debug('REFILL: In cooldown, waiting %d more seconds before next attempt', remainingSeconds)
-			end
-			return
-		end
-		-- Cooldown expired, clear flag
-		self:debug('REFILL: Cooldown expired, ready for new refill attempt')
-		self.refillFailedTimestamp = nil
+
+	if self.drivingToLoaderActive or self.waitingForFieldBoundary then
+		-- Already in progress, nothing to do.
+		return true
 	end
-	
-	if not self.drivingToLoaderActive and not self.waitingForFieldBoundary and cpSpec.driveStrategy then
+
+	if not cpSpec.driveStrategy then
+		-- Nothing to switch away from, can't start the refill drive. Let the caller decide what to do
+		-- (e.g. stop the job) instead of silently doing nothing forever.
+		self:debug('REFILL: No active drive strategy, cannot start driving to a loader')
+		return false
+	end
+
+	do
 		CpUtil.info('=========================================')
 		CpUtil.info('REFILL: Starting automatic drive to loader')
 		CpUtil.info('REFILL: Current waypoint: %d', cpSpec.driveStrategy.ppc:getCurrentWaypointIx())
-		
-		-- WICHTIG: Fahrzeug sofort anhalten während Strategie-Wechsel
-		self.vehicle:cpHold(60000, true)  -- 60 Sekunden maximale Haltezeit
+
+		-- Stop the vehicle immediately while we switch strategies.
+		self.vehicle:cpHold(60000, true)  -- 60 second maximum hold time
 		CpUtil.info('REFILL: ✓ Vehicle STOPPED during strategy switch')
 		
 		-- Try to get field polygon
@@ -100,7 +101,7 @@ function CpAITaskFieldWork:setDrivingToLoaderActive()
 			
 			-- Set flag to wait for boundary detection
 			self.waitingForFieldBoundary = true
-			return  -- Don't proceed with refill yet
+			return true  -- Don't proceed with refill yet, but this is not a failure
 		end
 		
 		self.drivingToLoaderActive = true
@@ -138,25 +139,35 @@ function CpAITaskFieldWork:setDrivingToLoaderActive()
 		self.refillStrategy:setAIVehicle(self.vehicle, self.job:getCpJobParameters())
 		CpUtil.info('REFILL: setAIVehicle done')
 
-		-- IMPORTANT: replace active AIFieldWorker strategy list as well,
-		-- otherwise the old fieldwork strategy may keep running in parallel and trigger off-track stops.
-		local aiSpec = self.vehicle.spec_aiFieldWorker
-		if aiSpec and aiSpec.driveStrategies then
-			for i = #aiSpec.driveStrategies, 1, -1 do
-				aiSpec.driveStrategies[i]:delete()
-				table.remove(aiSpec.driveStrategies, i)
-			end
-		else
-			aiSpec.driveStrategies = {}
-		end
-		table.insert(aiSpec.driveStrategies, self.refillStrategy)
-		cpSpec.driveStrategy = self.refillStrategy
-		
+		-- Replace the active AIFieldWorker strategy list as well, otherwise the old fieldwork
+		-- strategy may keep running in parallel and trigger off-track stops.
+		self:replaceDriveStrategy(self.refillStrategy)
+
 		CpUtil.info('REFILL: Calling startCpWithStrategy...')
 		self.vehicle:startCpWithStrategy(self.refillStrategy)
 		CpUtil.info('REFILL: ✓ Refill strategy started successfully')
 		CpUtil.info('=========================================')
 	end
+	return true
+end
+
+--- Replaces the vehicle's active AIFieldWorker/CP drive strategy with newStrategy, deleting any
+--- previously installed strategies first. Used both when switching to the refill-at-loader
+--- strategy and when switching back to the fieldwork strategy afterwards.
+---@param newStrategy AIDriveStrategyCourse
+function CpAITaskFieldWork:replaceDriveStrategy(newStrategy)
+	local aiSpec = self.vehicle.spec_aiFieldWorker
+	local cpSpec = self.vehicle.spec_cpAIFieldWorker
+	if aiSpec.driveStrategies then
+		for i = #aiSpec.driveStrategies, 1, -1 do
+			aiSpec.driveStrategies[i]:delete()
+			table.remove(aiSpec.driveStrategies, i)
+		end
+	else
+		aiSpec.driveStrategies = {}
+	end
+	table.insert(aiSpec.driveStrategies, newStrategy)
+	cpSpec.driveStrategy = newStrategy
 end
 
 function CpAITaskFieldWork:update(dt)
@@ -270,18 +281,7 @@ function CpAITaskFieldWork:update(dt)
 					local strategy = AIDriveStrategyFieldWorkCourse(self, self.job)
 					strategy:setAIVehicle(self.vehicle, self.job:getCpJobParameters())
 					strategy:start(self.savedCourse, self.savedWaypointIx, self.job:getCpJobParameters())
-					local aiSpec = self.vehicle.spec_aiFieldWorker
-					local cpSpec = self.vehicle.spec_cpAIFieldWorker
-					if aiSpec and aiSpec.driveStrategies then
-						for i = #aiSpec.driveStrategies, 1, -1 do
-							aiSpec.driveStrategies[i]:delete()
-							table.remove(aiSpec.driveStrategies, i)
-						end
-					else
-						aiSpec.driveStrategies = {}
-					end
-					table.insert(aiSpec.driveStrategies, strategy)
-					cpSpec.driveStrategy = strategy
+					self:replaceDriveStrategy(strategy)
 					self.vehicle:startCpWithStrategy(strategy)
 					self.savedCourse = nil
 					self.savedWaypointIx = nil
